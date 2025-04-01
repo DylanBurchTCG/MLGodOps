@@ -844,6 +844,15 @@ def train_cascaded_model(model,
                         # gradient accumulation
                         loss = loss / gradient_accumulation_steps
 
+                    # Skip backward pass if loss is invalid
+                    if not torch.isfinite(loss):
+                        if verbose:
+                            print(f"WARNING: Skipping batch {batch_idx} due to non-finite loss: {loss.item()}")
+                        # Need to potentially zero_grad if accumulation happened before invalid loss
+                        if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                             optimizer.zero_grad()
+                        continue # Skip the rest of the loop for this batch
+
                     scaler.scale(loss).backward()
 
                     if (batch_idx + 1) % gradient_accumulation_steps == 0:
@@ -928,6 +937,16 @@ def train_cascaded_model(model,
                         loss = torch.tensor(1.0, device=device)  # Safe fallback
 
                     loss = loss / gradient_accumulation_steps
+
+                    # Skip backward pass if loss is invalid
+                    if not torch.isfinite(loss):
+                        if verbose:
+                            print(f"WARNING: Skipping batch {batch_idx} due to non-finite loss: {loss.item()}")
+                        # Need to potentially zero_grad if accumulation happened before invalid loss
+                        if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                            optimizer.zero_grad()
+                        continue # Skip the rest of the loop for this batch
+
                     loss.backward()
 
                     if (batch_idx + 1) % gradient_accumulation_steps == 0:
