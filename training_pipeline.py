@@ -20,8 +20,18 @@ class LeadDataset(Dataset):
     def __init__(self, categorical_features, numerical_features,
                  toured_labels=None, applied_labels=None, rented_labels=None,
                  lead_ids=None):
-        self.categorical_features = categorical_features
-        self.numerical_features = numerical_features
+        # Ensure categorical features are long type for embedding lookup
+        if categorical_features is not None and categorical_features.dtype != torch.long:
+            self.categorical_features = categorical_features.long()
+        else:
+            self.categorical_features = categorical_features
+            
+        # Ensure numerical features are float type
+        if numerical_features is not None and numerical_features.dtype != torch.float32:
+            self.numerical_features = numerical_features.float()
+        else:
+            self.numerical_features = numerical_features
+            
         self.toured_labels = toured_labels
         self.applied_labels = applied_labels
         self.rented_labels = rented_labels
@@ -32,7 +42,7 @@ class LeadDataset(Dataset):
 
     def __getitem__(self, idx):
         items = [
-            self.categorical_features[idx] if self.categorical_features is not None else torch.tensor([]),
+            self.categorical_features[idx] if self.categorical_features is not None else torch.tensor([], dtype=torch.long),
             self.numerical_features[idx]
         ]
 
@@ -82,8 +92,8 @@ def rank_leads_multi_stage(model, dataloader,
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Ranking leads"):
-            cat_in = batch[0].to(device)
-            num_in = batch[1].to(device)
+            cat_in = batch[0].to(device).long()  # Ensure long type for embedding
+            num_in = batch[1].to(device).float()  # Ensure float type for numerical
             lead_ids = batch[-1].cpu().numpy()
 
             # Skip empty batches
@@ -270,8 +280,8 @@ def finetune_with_external_examples(model,
         num_batches = 0
 
         for batch in ext_loader:
-            cat_in = batch[0].to(device)
-            num_in = batch[1].to(device)
+            cat_in = batch[0].to(device).long()  # Ensure long type for embedding
+            num_in = batch[1].to(device).float()  # Ensure float type for numerical
             toured_labels = batch[2].to(device)
             applied_labels = batch[3].to(device)
             rented_labels = batch[4].to(device)
@@ -373,8 +383,8 @@ def train_model(model,
 
         train_iter = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs} [Train]")
         for batch_idx, batch in enumerate(train_iter):
-            categorical_inputs = batch[0].to(device)
-            numerical_inputs = batch[1].to(device)
+            categorical_inputs = batch[0].to(device).long()  # Ensure long type for embedding
+            numerical_inputs = batch[1].to(device).float()  # Ensure float type for numerical
             toured_labels = batch[2].to(device)
             applied_labels = batch[3].to(device)
             rented_labels = batch[4].to(device)
@@ -571,8 +581,8 @@ def train_model(model,
 
         valid_iter = tqdm(valid_loader, desc=f"Epoch {epoch + 1}/{num_epochs} [Valid]")
         for batch in valid_iter:
-            categorical_inputs = batch[0].to(device)
-            numerical_inputs = batch[1].to(device)
+            categorical_inputs = batch[0].to(device).long()  # Ensure long type for embedding
+            numerical_inputs = batch[1].to(device).float()  # Ensure float type for numerical
             toured_labels = batch[2].to(device)
             applied_labels = batch[3].to(device)
             rented_labels = batch[4].to(device)
@@ -749,8 +759,8 @@ def perform_stage_specific_clustering(dataloader, model, device,
     
     with torch.no_grad():
         for batch in tqdm(dataloader, desc=f"Extracting data for {stage} clustering"):
-            cat_in = batch[0].to(device)
-            num_in = batch[1].to(device)
+            cat_in = batch[0].to(device).long()  # Ensure long type for embedding
+            num_in = batch[1].to(device).float()  # Ensure float type for numerical
             toured_labels = batch[2].cpu().numpy()
             applied_labels = batch[3].cpu().numpy()
             rented_labels = batch[4].cpu().numpy()
@@ -1056,8 +1066,8 @@ def evaluate_cluster_specific_metrics(model, dataloader, cluster_assignments, de
     
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating cluster metrics"):
-            cat_in = batch[0].to(device)
-            num_in = batch[1].to(device)
+            cat_in = batch[0].to(device).long()  # Ensure long type for embedding
+            num_in = batch[1].to(device).float()  # Ensure float type for numerical
             toured_labels = batch[2].cpu().numpy()
             applied_labels = batch[3].cpu().numpy()
             rented_labels = batch[4].cpu().numpy()

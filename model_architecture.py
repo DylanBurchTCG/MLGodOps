@@ -12,17 +12,19 @@ class EmbeddingLayer(nn.Module):
 
     def __init__(self, categorical_dims, embedding_dims, numerical_dim):
         super().__init__()
-        self.categorical_layers = nn.ModuleList([
-            nn.Linear(1, emb_dim) for cat_dim, emb_dim in zip(categorical_dims, embedding_dims)
+        # Replace linear layers with proper embedding layers for categorical features
+        self.categorical_embeddings = nn.ModuleList([
+            nn.Embedding(cat_dim, emb_dim) for cat_dim, emb_dim in zip(categorical_dims, embedding_dims)
         ])
         self.numerical_bn = nn.BatchNorm1d(numerical_dim) if numerical_dim > 0 else None
 
     def forward(self, categorical_inputs, numerical_inputs):
         embedded_features = []
-        if len(self.categorical_layers) > 0:
-            for i, layer in enumerate(self.categorical_layers):
-                cat_feature = categorical_inputs[:, i].view(-1, 1)
-                embedded_features.append(layer(cat_feature))
+        if len(self.categorical_embeddings) > 0:
+            for i, embedding_layer in enumerate(self.categorical_embeddings):
+                # Convert to long tensor for embedding lookup
+                cat_feature = categorical_inputs[:, i].long()
+                embedded_features.append(embedding_layer(cat_feature))
 
         if self.numerical_bn is not None:
             numerical_features = self.numerical_bn(numerical_inputs)
@@ -283,6 +285,10 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
         batch_size = categorical_inputs.size(0)
         device = categorical_inputs.device
 
+        # Ensure inputs have the correct dtype
+        categorical_inputs = categorical_inputs.long()
+        numerical_inputs = numerical_inputs.float()
+
         # Initial embedding for all leads
         x = self.embedding_layer(categorical_inputs, numerical_inputs)
         x = self.projection(x)
@@ -324,7 +330,9 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
         else:
             # Apply slight noise to break ties randomly
             noise = torch.randn_like(toured_pred.squeeze()) * 1e-6
-            _, toured_indices = torch.topk(toured_pred.squeeze() + noise, k_toured)
+            # Make sure we're sorting a leaf tensor that requires_grad
+            sortable_scores = toured_pred.squeeze() + noise
+            _, toured_indices = torch.topk(sortable_scores, k_toured)
 
         if is_training:
             # During training, don't actually filter but track selection for loss weighting
@@ -349,12 +357,11 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
                     else:
                         k_applied = min(self.applied_k, len(toured_indices))
                         
-                    # Add noise to break ties randomly
+                    # Add noise to break ties
                     noise = torch.randn_like(applied_pred.squeeze()[toured_indices]) * 1e-6
-                    _, applied_indices_local = torch.topk(
-                        applied_pred.squeeze()[toured_indices] + noise, 
-                        k_applied
-                    )
+                    # Make sure we're sorting a leaf tensor that requires_grad
+                    sortable_scores = applied_pred.squeeze()[toured_indices] + noise
+                    _, applied_indices_local = torch.topk(sortable_scores, k_applied)
                 applied_indices = toured_indices[applied_indices_local]
 
             # Process all leads for the rented stage
@@ -381,10 +388,9 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
                         
                     # Add noise to break ties
                     noise = torch.randn_like(rented_pred.squeeze()[applied_indices]) * 1e-6
-                    _, rented_indices_local = torch.topk(
-                        rented_pred.squeeze()[applied_indices] + noise, 
-                        k_rented
-                    )
+                    # Make sure we're sorting a leaf tensor that requires_grad
+                    sortable_scores = rented_pred.squeeze()[applied_indices] + noise
+                    _, rented_indices_local = torch.topk(sortable_scores, k_rented)
                 rented_indices = applied_indices[rented_indices_local]
 
         else:
@@ -424,10 +430,9 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
                         
                     # Add noise to break ties
                     noise = torch.randn_like(applied_pred_subset.squeeze()) * 1e-6
-                    _, applied_indices_local = torch.topk(
-                        applied_pred_subset.squeeze() + noise, 
-                        k_applied
-                    )
+                    # Make sure we're sorting a leaf tensor
+                    sortable_scores = applied_pred_subset.squeeze() + noise
+                    _, applied_indices_local = torch.topk(sortable_scores, k_applied)
                 applied_indices = toured_indices[applied_indices_local]
 
             # Handle empty applied_indices
@@ -462,10 +467,9 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
                         
                     # Add noise to break ties
                     noise = torch.randn_like(rented_pred_subset.squeeze()) * 1e-6
-                    _, rented_indices_local = torch.topk(
-                        rented_pred_subset.squeeze() + noise, 
-                        k_rented
-                    )
+                    # Make sure we're sorting a leaf tensor
+                    sortable_scores = rented_pred_subset.squeeze() + noise
+                    _, rented_indices_local = torch.topk(sortable_scores, k_rented)
                 rented_indices = applied_indices[rented_indices_local]
 
         return toured_pred, applied_pred, rented_pred, toured_indices, applied_indices, rented_indices

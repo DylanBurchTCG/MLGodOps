@@ -388,7 +388,9 @@ def preprocess_data(
         X_train_cat_encoded = pd.DataFrame()
         X_test_cat_encoded = pd.DataFrame()
         categorical_encoders = {}
+        categorical_dims = []  # List to store categorical dimensions (number of unique values + 1)
 
+        # Use label encoding instead of target encoding for categorical features
         for i in range(0, len(categorical_cols), chunk_size):
             chunk_cols = categorical_cols[i: i + chunk_size]
             # Filter to only include columns actually in the data
@@ -397,38 +399,42 @@ def preprocess_data(
             if not chunk_cols:
                 continue  # Skip if no columns in this chunk
 
-            # For target encoding, if y_train_rent has only one class, use y_train_toured instead
-            encoding_target = y_train_rent
-            if encoding_target.nunique() <= 1:
-                print(
-                    f"Warning: Using 'toured' target for encoding because 'rented' has {encoding_target.nunique()} class")
-                encoding_target = y_train_toured
+            # Create a dictionary to store label encoders for each column
+            label_encoders = {}
+            chunk_train_encoded = pd.DataFrame()
+            chunk_test_encoded = pd.DataFrame()
+            
+            for col in chunk_cols:
+                try:
+                    # Create a label encoder for this column
+                    label_encoder = LabelEncoder()
+                    # Fit on both train and test to ensure all categories are captured
+                    combined_values = pd.concat([X_train_cat[col], X_test_cat[col]]).astype(str)
+                    label_encoder.fit(combined_values)
+                    
+                    # Transform train and test data
+                    train_encoded = label_encoder.transform(X_train_cat[col].astype(str))
+                    test_encoded = label_encoder.transform(X_test_cat[col].astype(str))
+                    
+                    # Store transformed data
+                    chunk_train_encoded[col] = train_encoded
+                    chunk_test_encoded[col] = test_encoded
+                    
+                    # Store the label encoder
+                    label_encoders[col] = label_encoder
+                    
+                    # Store the categorical dimension (number of unique categories)
+                    categorical_dims.append(len(label_encoder.classes_))
+                except Exception as e:
+                    print(f"Warning: Error encoding column {col}: {str(e)}")
+                    # If encoding fails, use a placeholder with 2 categories (0 and 1)
+                    chunk_train_encoded[col] = 0
+                    chunk_test_encoded[col] = 0
+                    categorical_dims.append(2)
 
-            try:
-                chunk_encoder = ce.TargetEncoder(cols=chunk_cols)
-                # We use encoding_target for the encoding target
-                chunk_train_encoded = chunk_encoder.fit_transform(X_train_cat[chunk_cols], encoding_target)
-                chunk_test_encoded = chunk_encoder.transform(X_test_cat[chunk_cols])
-
-                X_train_cat_encoded = pd.concat([X_train_cat_encoded, chunk_train_encoded], axis=1)
-                X_test_cat_encoded = pd.concat([X_test_cat_encoded, chunk_test_encoded], axis=1)
-
-                categorical_encoders[f"chunk_{i // chunk_size}"] = chunk_encoder
-            except Exception as e:
-                print(f"Warning: Error encoding chunk {i // chunk_size} with columns {chunk_cols}: {str(e)}")
-                # Try each column individually
-                for col in chunk_cols:
-                    try:
-                        col_encoder = ce.TargetEncoder(cols=[col])
-                        col_train_encoded = col_encoder.fit_transform(X_train_cat[[col]], encoding_target)
-                        col_test_encoded = col_encoder.transform(X_test_cat[[col]])
-
-                        X_train_cat_encoded = pd.concat([X_train_cat_encoded, col_train_encoded], axis=1)
-                        X_test_cat_encoded = pd.concat([X_test_cat_encoded, col_test_encoded], axis=1)
-
-                        categorical_encoders[f"col_{col}"] = col_encoder
-                    except Exception as inner_e:
-                        print(f"Warning: Could not encode column {col}: {str(inner_e)}")
+            X_train_cat_encoded = pd.concat([X_train_cat_encoded, chunk_train_encoded], axis=1)
+            X_test_cat_encoded = pd.concat([X_test_cat_encoded, chunk_test_encoded], axis=1)
+            categorical_encoders[f"chunk_{i // chunk_size}"] = label_encoders
 
         # Scale numerical
         if X_train_num.shape[1] > 0:
@@ -443,8 +449,8 @@ def preprocess_data(
             scaler = None
 
         # Convert to tensors
-        X_train_cat_tensor = torch.tensor(X_train_cat_encoded.values, dtype=torch.float32)
-        X_test_cat_tensor = torch.tensor(X_test_cat_encoded.values, dtype=torch.float32)
+        X_train_cat_tensor = torch.tensor(X_train_cat_encoded.values, dtype=torch.long)
+        X_test_cat_tensor = torch.tensor(X_test_cat_encoded.values, dtype=torch.long)
         X_train_num_tensor = torch.tensor(X_train_num_scaled, dtype=torch.float32)
         X_test_num_tensor = torch.tensor(X_test_num_scaled, dtype=torch.float32)
 
@@ -480,8 +486,8 @@ def preprocess_data(
             torch.tensor(test_ids.values if isinstance(test_ids, pd.Series) else test_ids)
         )
 
-        # Also compute dims for the model
-        categorical_dims = [1] * X_train_cat_encoded.shape[1]  # target-encoded => each col is dimension=1
+        # Note: We don't need to change the cat_dims calculation anymore
+        # since we're directly calculating it during encoding
         numerical_dim = X_train_num_scaled.shape[1]
         feature_names = list(X_train_cat_encoded.columns) + list(num_data.columns)
 
@@ -735,33 +741,64 @@ def prepare_external_examples(external_data, preprocessors_path='./preprocessors
     for col in numerical_cols:
         num_data[col] = num_data[col].fillna(0)
 
-    # Apply chunked encoders
+    # Apply label encoders from preprocessors
     print("Applying categorical encoders...")
     cat_encoded = pd.DataFrame()
 
-    for chunk_name, encoder in categorical_encoders.items():
+    for chunk_name, encoder_dict in categorical_encoders.items():
         try:
-            # Handle both numbered chunks and column-specific encoders
+            # Get the columns in this chunk
             if chunk_name.startswith('chunk_'):
                 chunk_idx = int(chunk_name.split('_')[1]) if '_' in chunk_name else 0
                 chunk_size = 50
                 start_idx = chunk_idx * chunk_size
                 end_idx = start_idx + chunk_size
                 chunk_cols = categorical_cols[start_idx:end_idx]
+                chunk_cols = [col for col in chunk_cols if col in cat_data.columns]
+                
+                # For each column in this chunk, apply the corresponding label encoder
+                chunk_encoded = pd.DataFrame()
+                for col in chunk_cols:
+                    if col in encoder_dict:
+                        label_encoder = encoder_dict[col]
+                        # Ensure all values are strings for encoding
+                        cat_col_data = cat_data[col].astype(str)
+                        
+                        # Handle unseen categories
+                        unique_values = set(cat_col_data.unique())
+                        known_values = set(label_encoder.classes_)
+                        unknown_values = unique_values - known_values
+                        
+                        if unknown_values:
+                            print(f"Warning: Column {col} has {len(unknown_values)} new categories not seen in training")
+                            # Replace unknown values with a known value (first class)
+                            for val in unknown_values:
+                                cat_col_data = cat_col_data.replace(val, label_encoder.classes_[0])
+                        
+                        # Transform and add to encoded data
+                        try:
+                            encoded_values = label_encoder.transform(cat_col_data)
+                            chunk_encoded[col] = encoded_values
+                        except Exception as e:
+                            print(f"Error encoding column {col}: {str(e)} - using zeros")
+                            chunk_encoded[col] = 0
+                    else:
+                        print(f"Warning: No encoder found for column {col} - using zeros")
+                        chunk_encoded[col] = 0
+                
+                cat_encoded = pd.concat([cat_encoded, chunk_encoded], axis=1)
             elif chunk_name.startswith('col_'):
-                chunk_cols = [chunk_name.split('_', 1)[1]]
-            else:
-                # Default handling for unexpected encoder names
-                print(f"Warning: Unexpected encoder name format: {chunk_name}")
-                continue
-
-            valid_cols = [col for col in chunk_cols if col in cat_data.columns]
-            if valid_cols:
-                transformed_chunk = encoder.transform(cat_data[valid_cols])
-                cat_encoded = pd.concat([cat_encoded, transformed_chunk], axis=1)
+                # Handle individual column encoders if any
+                col = chunk_name.split('_', 1)[1]
+                if col in cat_data.columns:
+                    try:
+                        encoded_values = encoder_dict.transform(cat_data[[col]])
+                        cat_encoded[col] = encoded_values
+                    except Exception as e:
+                        print(f"Error encoding column {col}: {str(e)} - using zeros")
+                        cat_encoded[col] = 0
         except Exception as e:
-            print(f"Warning: Error applying encoder {chunk_name}: {str(e)}")
-            # Try to continue with other encoders
+            print(f"Warning: Error applying encoders for {chunk_name}: {str(e)}")
 
     # Scale numeric
     print("Scaling numerical features...")
@@ -776,9 +813,9 @@ def prepare_external_examples(external_data, preprocessors_path='./preprocessors
         print("No scaler available or no numerical features - using standardized values")
         num_scaled = (num_data - num_data.mean()) / num_data.std().replace(0, 1)
 
-    # Convert to tensors
+    # Convert to tensors - categorical as long for embedding lookup
     print("Converting to tensors...")
-    cat_tensor = torch.tensor(cat_encoded.values, dtype=torch.float32)
+    cat_tensor = torch.tensor(cat_encoded.values, dtype=torch.long)
     num_tensor = torch.tensor(num_scaled, dtype=torch.float32)
     y_toured_t = torch.tensor(y_toured.values, dtype=torch.float32).view(-1, 1)
     y_applied_t = torch.tensor(y_applied.values, dtype=torch.float32).view(-1, 1)

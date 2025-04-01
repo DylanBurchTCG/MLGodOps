@@ -106,8 +106,8 @@ def calculate_metrics(dataloader, model, device, k_values=[10, 20, 50, 100]):
 
     with torch.no_grad():
         for batch in dataloader:
-            cat_in = batch[0].to(device)
-            num_in = batch[1].to(device)
+            cat_in = batch[0].to(device).long()  # Ensure long type for embedding
+            num_in = batch[1].to(device).float()  # Ensure float type for numerical
             toured_labels = batch[2].cpu().numpy()
             applied_labels = batch[3].cpu().numpy()
             rented_labels = batch[4].cpu().numpy()
@@ -186,6 +186,10 @@ def enable_debug_mode(model):
         print(f"\n--- Starting debug forward pass ---")
         print(f"Categorical inputs shape: {categorical_inputs.shape}")
         print(f"Numerical inputs shape: {numerical_inputs.shape}")
+
+        # Ensure correct types
+        categorical_inputs = categorical_inputs.long()
+        numerical_inputs = numerical_inputs.float()
 
         x = self.embedding_layer(categorical_inputs, numerical_inputs)
         print(f"After embedding layer shape: {x.shape}")
@@ -316,8 +320,8 @@ def finetune_cascaded_with_external_examples(model,
         num_batches = 0
 
         for batch in ext_loader:
-            cat_in = batch[0].to(device)
-            num_in = batch[1].to(device)
+            cat_in = batch[0].to(device).long()  # Ensure long type for embedding
+            num_in = batch[1].to(device).float()  # Ensure float type for numerical
             toured_labels = batch[2].to(device)
             applied_labels = batch[3].to(device)
             rented_labels = batch[4].to(device)
