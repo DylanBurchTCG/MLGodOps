@@ -675,3 +675,185 @@ def train_model(model,
         print("Continuing with current model state...")
 
     return model, history
+
+
+# ----------------
+# Stage-Specific Clustering
+# ----------------
+def perform_stage_specific_clustering(dataloader, model, device, 
+                                     n_clusters=10, 
+                                     stage='toured',
+                                     feature_extraction_layer=None,
+                                     use_umap=True,
+                                     random_state=42):
+    """
+    Perform clustering specifically on leads that have reached a certain stage.
+    This provides better insights into lead characteristics at each funnel stage.
+    
+    Args:
+        dataloader: DataLoader containing the leads
+        model: Trained model
+        device: Device to use for prediction
+        n_clusters: Number of clusters to create
+        stage: Which stage to analyze ('toured', 'applied', 'rented')
+        feature_extraction_layer: Optional hook to extract intermediate features
+        use_umap: Whether to use UMAP dimensionality reduction before clustering
+        
+    Returns:
+        Dictionary with cluster assignments, centroids, and visualizations
+    """
+    from sklearn.cluster import KMeans
+    import matplotlib.pyplot as plt
+    
+    # First, use the model to get predictions and select leads for the stage
+    model.eval()
+    all_lead_ids = []
+    all_features = []
+    all_labels = {'toured': [], 'applied': [], 'rented': []}
+    all_preds = {'toured': [], 'applied': [], 'rented': []}
+    
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc=f"Extracting data for {stage} clustering"):
+            cat_in = batch[0].to(device)
+            num_in = batch[1].to(device)
+            toured_labels = batch[2].cpu().numpy()
+            applied_labels = batch[3].cpu().numpy()
+            rented_labels = batch[4].cpu().numpy()
+            lead_ids = batch[5].cpu().numpy() if len(batch) > 5 else np.arange(len(cat_in))
+            
+            # Forward pass through model 
+            outputs = model(cat_in, num_in)
+            
+            # Get stage predictions
+            if isinstance(outputs, tuple) and len(outputs) >= 3:
+                toured_pred, applied_pred, rented_pred = outputs[:3]
+            else:
+                toured_pred, applied_pred, rented_pred = outputs
+                
+            # Extract embeddings if a feature extraction layer is provided
+            if feature_extraction_layer is not None:
+                # This would need a hook mechanism to extract features from the model
+                features = feature_extraction_layer.cpu().numpy()
+            else:
+                # Use concatenated inputs as features if no specific layer provided
+                features = torch.cat([cat_in, num_in], dim=1).cpu().numpy()
+            
+            # Store everything
+            all_lead_ids.extend(lead_ids)
+            all_features.extend(features)
+            all_labels['toured'].extend(toured_labels)
+            all_labels['applied'].extend(applied_labels)
+            all_labels['rented'].extend(rented_labels)
+            all_preds['toured'].extend(toured_pred.cpu().numpy())
+            all_preds['applied'].extend(applied_pred.cpu().numpy())
+            all_preds['rented'].extend(rented_pred.cpu().numpy())
+    
+    # Convert to arrays
+    all_lead_ids = np.array(all_lead_ids)
+    all_features = np.array(all_features)
+    for s in all_labels:
+        all_labels[s] = np.array(all_labels[s])
+        all_preds[s] = np.array(all_preds[s])
+    
+    # Now apply stage-specific filtering
+    if stage == 'toured':
+        # Use actual toured leads or predicted ones
+        lead_mask = all_labels['toured'].flatten() > 0
+        stage_leads = all_lead_ids[lead_mask]
+        stage_features = all_features[lead_mask]
+        stage_labels = all_labels['toured'][lead_mask]
+        stage_preds = all_preds['toured'][lead_mask]
+        print(f"Selected {len(stage_leads)} leads with actual toured=1 for clustering")
+    elif stage == 'applied':
+        # Use actual applied leads or predicted ones
+        lead_mask = all_labels['applied'].flatten() > 0
+        stage_leads = all_lead_ids[lead_mask]
+        stage_features = all_features[lead_mask]
+        stage_labels = all_labels['applied'][lead_mask]
+        stage_preds = all_preds['applied'][lead_mask]
+        print(f"Selected {len(stage_leads)} leads with actual applied=1 for clustering")
+    elif stage == 'rented':
+        # Use actual rented leads or predicted ones
+        lead_mask = all_labels['rented'].flatten() > 0
+        stage_leads = all_lead_ids[lead_mask]
+        stage_features = all_features[lead_mask]
+        stage_labels = all_labels['rented'][lead_mask]
+        stage_preds = all_preds['rented'][lead_mask]
+        print(f"Selected {len(stage_leads)} leads with actual rented=1 for clustering")
+    else:
+        raise ValueError(f"Unknown stage: {stage}")
+    
+    # Make sure we have enough leads for clustering
+    if len(stage_leads) < n_clusters:
+        print(f"Warning: Not enough leads ({len(stage_leads)}) for {n_clusters} clusters")
+        n_clusters = max(2, len(stage_leads) // 2)
+        print(f"Reducing to {n_clusters} clusters")
+    
+    # Apply dimensionality reduction if needed
+    if use_umap and stage_features.shape[1] > 50:
+        try:
+            import umap
+            reducer = umap.UMAP(random_state=random_state)
+            print(f"Reducing dimensionality from {stage_features.shape[1]} features using UMAP...")
+            stage_features_reduced = reducer.fit_transform(stage_features)
+        except ImportError:
+            print("UMAP not installed. Using original features.")
+            stage_features_reduced = stage_features
+    else:
+        stage_features_reduced = stage_features
+    
+    # Apply clustering
+    kmeans = KMeans(n_clusters=n_clusters, random_state=random_state)
+    print(f"Clustering {len(stage_features_reduced)} leads into {n_clusters} clusters...")
+    cluster_labels = kmeans.fit_predict(stage_features_reduced)
+    
+    # Count leads per cluster
+    cluster_counts = {}
+    for i in range(n_clusters):
+        cluster_counts[i] = np.sum(cluster_labels == i)
+    
+    # For rented stage, check if there's a cluster with significantly higher conversion rate
+    if stage == 'rented':
+        print("Analyzing rented stage clusters for conversion patterns...")
+        cluster_conversion_rates = {}
+        for i in range(n_clusters):
+            cluster_mask = cluster_labels == i
+            # Only calculate if we have at least 5 leads in the cluster
+            if np.sum(cluster_mask) >= 5:
+                cluster_conversion_rates[i] = np.mean(stage_labels[cluster_mask])
+        
+        if cluster_conversion_rates:
+            # Find highest conversion cluster
+            best_cluster = max(cluster_conversion_rates.items(), key=lambda x: x[1])
+            print(f"Cluster {best_cluster[0]} has highest conversion rate: {best_cluster[1]:.1%}")
+    
+    # Create simple visualization if UMAP was used
+    if use_umap and stage_features_reduced.shape[1] == 2:
+        plt.figure(figsize=(10, 8))
+        plt.scatter(stage_features_reduced[:, 0], stage_features_reduced[:, 1], 
+                   c=cluster_labels, cmap='viridis', alpha=0.6)
+        plt.colorbar(label='Cluster')
+        plt.title(f'{stage.capitalize()} Stage Clustering')
+        plt.tight_layout()
+        
+        # Save as bytes
+        from io import BytesIO
+        buf = BytesIO()
+        plt.savefig(buf, format='png')
+        buf.seek(0)
+        plot_bytes = buf.getvalue()
+        plt.close()
+    else:
+        plot_bytes = None
+    
+    results = {
+        'stage': stage,
+        'n_clusters': n_clusters,
+        'lead_ids': stage_leads,
+        'cluster_labels': cluster_labels,
+        'centroids': kmeans.cluster_centers_,
+        'cluster_counts': cluster_counts,
+        'plot_bytes': plot_bytes
+    }
+    
+    return results

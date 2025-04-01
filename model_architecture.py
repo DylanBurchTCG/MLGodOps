@@ -177,7 +177,11 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
                  dropout=0.2,
                  toured_k=2000,
                  applied_k=1000,
-                 rented_k=250):  # Updated default to 250 for rented_k
+                 rented_k=250,
+                 use_percentages=False,  # NEW: Flag to use percentages instead of fixed counts
+                 toured_pct=None,       # NEW: Percentage of leads to select for touring stage
+                 applied_pct=None,      # NEW: Percentage of toured leads to select for applying stage
+                 rented_pct=None):      # NEW: Percentage of applied leads to select for renting stage
         super().__init__()
 
         # Stage filtering parameters
@@ -185,11 +189,20 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
         self.applied_k = applied_k
         self.rented_k = rented_k
         
+        # NEW: Percentage-based selection parameters
+        self.use_percentages = use_percentages
+        self.toured_pct = toured_pct if toured_pct is not None else 0.5  # Default 50%
+        self.applied_pct = applied_pct if applied_pct is not None else 0.5  # Default 50%
+        self.rented_pct = rented_pct if rented_pct is not None else 0.5  # Default 50%
+        
         print(f"Initializing MultiTaskCascadedLeadFunnelModel with: ")
         print(f"  - {len(categorical_dims)} categorical features")
         print(f"  - {numerical_dim} numerical features")
         print(f"  - Transformer dim: {transformer_dim}, heads: {num_heads}")
-        print(f"  - Selection flow: {toured_k} -> {applied_k} -> {rented_k}")
+        if use_percentages:
+            print(f"  - Selection by percentage: {self.toured_pct*100:.1f}% -> {self.applied_pct*100:.1f}% -> {self.rented_pct*100:.1f}%")
+        else:
+            print(f"  - Selection flow: {toured_k} -> {applied_k} -> {rented_k}")
 
         # 1. Embedding layer
         self.embedding_layer = EmbeddingLayer(categorical_dims, embedding_dims, numerical_dim)
@@ -263,8 +276,12 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
         if toured_pred.dim() == 1:
             toured_pred = toured_pred.unsqueeze(1)
 
-        # Select top toured leads - use min to avoid errors with small batches
-        k_toured = min(self.toured_k, batch_size)
+        # NEW: Determine k for toured stage - either fixed count or percentage
+        if self.use_percentages:
+            k_toured = max(1, int(batch_size * self.toured_pct))
+        else:
+            k_toured = min(self.toured_k, batch_size)
+            
         if toured_pred.squeeze().dim() == 0:  # Handle scalar case
             toured_indices = torch.tensor([0], device=device)
         else:
@@ -289,7 +306,12 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
                 if applied_pred.squeeze()[toured_indices].dim() == 0:
                     applied_indices_local = torch.tensor([0], device=device)
                 else:
-                    k_applied = min(self.applied_k, len(toured_indices))
+                    # NEW: Determine k for applied stage - either fixed count or percentage
+                    if self.use_percentages:
+                        k_applied = max(1, int(len(toured_indices) * self.applied_pct))
+                    else:
+                        k_applied = min(self.applied_k, len(toured_indices))
+                        
                     # Add noise to break ties randomly
                     noise = torch.randn_like(applied_pred.squeeze()[toured_indices]) * 1e-6
                     _, applied_indices_local = torch.topk(
@@ -314,7 +336,12 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
                 if rented_pred.squeeze()[applied_indices].dim() == 0:
                     rented_indices_local = torch.tensor([0], device=device)
                 else:
-                    k_rented = min(self.rented_k, len(applied_indices))
+                    # NEW: Determine k for rented stage - either fixed count or percentage
+                    if self.use_percentages:
+                        k_rented = max(1, int(len(applied_indices) * self.rented_pct))
+                    else:
+                        k_rented = min(self.rented_k, len(applied_indices))
+                        
                     # Add noise to break ties
                     noise = torch.randn_like(rented_pred.squeeze()[applied_indices]) * 1e-6
                     _, rented_indices_local = torch.topk(
@@ -352,7 +379,12 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
                 if applied_pred_subset.squeeze().dim() == 0:
                     applied_indices_local = torch.tensor([0], device=device)
                 else:
-                    k_applied = min(self.applied_k, len(toured_indices))
+                    # NEW: Determine k for applied stage - either fixed count or percentage
+                    if self.use_percentages:
+                        k_applied = max(1, int(len(toured_indices) * self.applied_pct))
+                    else:
+                        k_applied = min(self.applied_k, len(toured_indices))
+                        
                     # Add noise to break ties
                     noise = torch.randn_like(applied_pred_subset.squeeze()) * 1e-6
                     _, applied_indices_local = torch.topk(
@@ -385,7 +417,12 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
                 if rented_pred_subset.squeeze().dim() == 0:
                     rented_indices_local = torch.tensor([0], device=device)
                 else:
-                    k_rented = min(self.rented_k, len(applied_indices))
+                    # NEW: Determine k for rented stage - either fixed count or percentage
+                    if self.use_percentages:
+                        k_rented = max(1, int(len(applied_indices) * self.rented_pct))
+                    else:
+                        k_rented = min(self.rented_k, len(applied_indices))
+                        
                     # Add noise to break ties
                     noise = torch.randn_like(rented_pred_subset.squeeze()) * 1e-6
                     _, rented_indices_local = torch.topk(

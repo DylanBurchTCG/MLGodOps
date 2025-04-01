@@ -15,7 +15,8 @@ import csv
 from model_architecture import MultiTaskCascadedLeadFunnelModel, train_cascaded_model, cascade_rank_leads, \
     precision_at_k
 from training_pipeline import (analyze_group_differences,
-                               finetune_with_external_examples)
+                               finetune_with_external_examples,
+                               perform_stage_specific_clustering)
 from data_preparation import (preprocess_data,
                               prepare_external_examples,
                               visualize_group_differences)
@@ -39,7 +40,21 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=30, help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
 
-    # Updated cascade parameters for 2k -> 1k -> 500 -> 250 flow
+    # Funnel selection options - fixed count vs. percentage-based
+    parser.add_argument('--use_percentages', action='store_true', 
+                        help='Use percentage-based selection instead of fixed counts')
+    parser.add_argument('--adapt_to_data', action='store_true',
+                        help='Automatically adapt percentages to match actual data distribution')
+    
+    # Percentage-based funnel parameters
+    parser.add_argument('--toured_pct', type=float, default=0.5, 
+                        help='Percentage of leads to select for toured stage (default: 50%)')
+    parser.add_argument('--applied_pct', type=float, default=0.5, 
+                        help='Percentage of toured leads to select for applied stage (default: 50%)')
+    parser.add_argument('--rented_pct', type=float, default=0.5, 
+                        help='Percentage of applied leads to select for rented stage (default: 50%)')
+    
+    # Fixed count funnel parameters (traditional approach)
     parser.add_argument('--toured_k', type=int, default=1000, help='Number of leads to select at toured stage (from 2000)')
     parser.add_argument('--applied_k', type=int, default=500, help='Number of leads to select at applied stage (from 1000)')
     parser.add_argument('--rented_k', type=int, default=250, help='Number of leads to select at rented stage (from 500)')
@@ -64,6 +79,12 @@ def parse_args():
                         help='Initial size of each subset (default 2000 leads)')
     parser.add_argument('--balance_classes', type=bool, default=False,
                         help='Whether to balance classes in each subset')
+
+    parser.add_argument('--stage_analysis', action='store_true', help='Enable stage-specific analysis')
+    parser.add_argument('--n_clusters', type=int, default=8,
+                        help='Number of clusters for stage-specific analysis')
+    parser.add_argument('--skip_umap', action='store_true',
+                        help='Skip UMAP dimension reduction for clustering')
 
     return parser.parse_args()
 
@@ -439,9 +460,102 @@ def save_consolidated_results(results, train_dataset, test_dataset, metrics, ran
     print(f"Consolidated results saved to {csv_path}")
 
 
+def calculate_actual_stage_rates(train_dataset, preprocessed_rates=None):
+    """
+    Calculate the actual positive rates for each stage in the dataset
+    to help set more realistic selection thresholds.
+    
+    Args:
+        train_dataset: The training dataset
+        preprocessed_rates: Optional dictionary of rates from preprocessing
+    """
+    # If we have preprocessed rates, use them
+    if preprocessed_rates:
+        # Just make sure we have all the rates we need
+        rates = preprocessed_rates.copy()
+        
+        # Add buffer values if not already present
+        if 'toured_pct' not in rates:
+            rates['toured_pct'] = min(1.0, rates.get('toured_rate', 0.1) * 1.2)  # 20% buffer
+        
+        if 'applied_pct' not in rates:
+            # Use conditional rate if available
+            if 'applied_given_toured' in rates and rates['applied_given_toured'] > 0:
+                rates['applied_pct'] = min(1.0, rates['applied_given_toured'] * 1.2)
+            else:
+                rates['applied_pct'] = min(1.0, rates.get('applied_rate', 0.1) / max(0.001, rates.get('toured_rate', 0.1)) * 1.2)
+        
+        if 'rented_pct' not in rates:
+            # Use conditional rate if available
+            if 'rented_given_applied' in rates and rates['rented_given_applied'] > 0:
+                rates['rented_pct'] = min(1.0, rates['rented_given_applied'] * 1.2)
+            else:
+                rates['rented_pct'] = min(1.0, rates.get('rented_rate', 0.1) / max(0.001, rates.get('applied_rate', 0.1)) * 1.2)
+        
+        return rates
+    
+    # Calculate from dataset if no preprocessed rates
+    toured_labels = torch.stack([item[2] for item in train_dataset]).flatten()
+    applied_labels = torch.stack([item[3] for item in train_dataset]).flatten()
+    rented_labels = torch.stack([item[4] for item in train_dataset]).flatten()
+    
+    # Calculate positive rates
+    toured_rate = toured_labels.float().mean().item()
+    applied_rate = applied_labels.float().mean().item()
+    rented_rate = rented_labels.float().mean().item()
+    
+    # Try to calculate conditional rates when possible
+    # Get indices where toured=1 and applied=1
+    toured_mask = (toured_labels == 1).flatten()
+    applied_mask = (applied_labels == 1).flatten()
+    
+    # Calculate conditional rates
+    applied_given_toured = applied_labels[toured_mask].float().mean().item() if toured_mask.sum() > 0 else 0
+    rented_given_applied = rented_labels[applied_mask].float().mean().item() if applied_mask.sum() > 0 else 0
+    
+    rates = {
+        'toured_rate': toured_rate,
+        'applied_rate': applied_rate,
+        'rented_rate': rented_rate,
+        'applied_given_toured': applied_given_toured,
+        'rented_given_applied': rented_given_applied,
+        # Add buffer to ensure we don't miss candidates
+        'toured_pct': min(1.0, toured_rate * 1.2),  # 20% buffer
+        'applied_pct': min(1.0, applied_given_toured * 1.2) if applied_given_toured > 0 else min(1.0, applied_rate / max(0.001, toured_rate) * 1.2),
+        'rented_pct': min(1.0, rented_given_applied * 1.2) if rented_given_applied > 0 else min(1.0, rented_rate / max(0.001, applied_rate) * 1.2)
+    }
+    
+    return rates
+
+
 def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_dims, numerical_dim, results,
                        subset_label="single"):
     """Train and evaluate a model for a single subset, storing results in the results dictionary"""
+
+    # Get preprocessed stage rates if available
+    preprocessed_rates = results.get('preprocessing', {}).get('stage_rates', None)
+
+    # NEW: Calculate actual positive rates for adaptive thresholds
+    stage_rates = calculate_actual_stage_rates(train_dataset, preprocessed_rates)
+    print(f"\nActual stage rates in training data:")
+    print(f"  - Toured: {stage_rates['toured_rate']*100:.2f}% positive")
+    print(f"  - Applied: {stage_rates['applied_rate']*100:.2f}% positive")
+    print(f"  - Rented: {stage_rates['rented_rate']*100:.2f}% positive")
+    
+    if 'applied_given_toured' in stage_rates:
+        print(f"  - Applied when toured: {stage_rates['applied_given_toured']*100:.2f}%")
+    if 'rented_given_applied' in stage_rates:
+        print(f"  - Rented when applied: {stage_rates['rented_given_applied']*100:.2f}%")
+    
+    # NEW: Option to override percentage thresholds with actual rates
+    if args.use_percentages and getattr(args, 'adapt_to_data', False):
+        args.toured_pct = stage_rates['toured_pct']
+        args.applied_pct = stage_rates['applied_pct']
+        args.rented_pct = stage_rates['rented_pct']
+        print(f"\nAdapted selection percentages to data distribution:")
+        print(f"  - Toured threshold: {args.toured_pct*100:.2f}%")
+        print(f"  - Applied threshold: {args.applied_pct*100:.2f}%")
+        print(f"  - Rented threshold: {args.rented_pct*100:.2f}%")
 
     # Create DataLoader with appropriate batch size
     # For very large datasets, adjust the batch size to be realistic for GPU memory
@@ -468,10 +582,16 @@ def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_di
     print(f"Features: {len(categorical_dims)} categorical, {numerical_dim} numerical")
     print(f"Using device: {device}, Mixed precision: {args.mixed_precision}")
     print(f"Training config: batch_size={effective_batch_size}, grad_accum={args.gradient_accum}")
-    print(f"Selection flow: {args.toured_k} -> {args.applied_k} -> {args.rented_k}")
+    
+    # Print the selection approach being used
+    if args.use_percentages:
+        print(f"Selection by percentages: {args.toured_pct*100:.1f}% -> {args.applied_pct*100:.1f}% -> {args.rented_pct*100:.1f}%")
+    else:
+        print(f"Selection by fixed counts: {args.toured_k} -> {args.applied_k} -> {args.rented_k}")
+    
     print("="*80 + "\n")
     
-    # Initialize the multi-task cascaded model instead of regular cascaded model
+    # Initialize the multi-task cascaded model with updated parameters
     model = MultiTaskCascadedLeadFunnelModel(
         categorical_dims=categorical_dims,
         embedding_dims=embedding_dims,
@@ -483,7 +603,11 @@ def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_di
         dropout=0.2,
         toured_k=args.toured_k,
         applied_k=args.applied_k,
-        rented_k=args.rented_k
+        rented_k=args.rented_k,
+        use_percentages=args.use_percentages,  # Pass new percentage flag
+        toured_pct=args.toured_pct,            # Pass percentage values
+        applied_pct=args.applied_pct,
+        rented_pct=args.rented_pct
     ).to(device)
 
     # Print model size
@@ -598,8 +722,8 @@ def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_di
 
     # Create a consolidated summary CSV
     save_consolidated_results(results, train_dataset, test_dataset, metrics, rankings, summary_csv_path)
-
-    # Store results in the results dictionary
+    
+    # Store the initial results
     subset_results = {
         'history': history,
         'model_state_bytes': model_state_bytes,
@@ -612,7 +736,29 @@ def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_di
             'summary': summary_csv_path
         }
     }
-
+    
+    # NEW: Perform stage-specific analysis if enabled
+    if getattr(args, 'stage_analysis', False):
+        try:
+            # Get feature names for analysis
+            feature_names = results.get('preprocessing', {}).get('feature_names', [])
+            
+            stage_analysis_results = perform_stage_specific_analysis(
+                model,
+                train_dataset,
+                test_dataset,
+                args,
+                device,
+                feature_names,
+                subset_label=subset_label
+            )
+            # Store the analysis results
+            subset_results['stage_analysis'] = stage_analysis_results
+        except Exception as e:
+            print(f"Warning: Stage analysis failed: {str(e)}")
+            print("Continuing without stage analysis...")
+    
+    # Store results in the results dictionary
     results[subset_label] = subset_results
 
     print(f"\nResult CSV files created:")
@@ -703,13 +849,14 @@ def train_with_seed(args, seed=None):
 
     # If we have a single subset
     if isinstance(preprocess_result, tuple):
-        train_dataset, test_dataset, categorical_dims, numerical_dim, feature_names = preprocess_result
+        train_dataset, test_dataset, categorical_dims, numerical_dim, feature_names, stage_rates = preprocess_result
 
         # Store preprocessing metadata
         results['preprocessing'] = {
             'categorical_dims': categorical_dims,
             'numerical_dim': numerical_dim,
-            'feature_names': feature_names
+            'feature_names': feature_names,
+            'stage_rates': stage_rates
         }
 
         # Train on the single dataset
@@ -730,13 +877,15 @@ def train_with_seed(args, seed=None):
         categorical_dims = preprocess_result['categorical_dims']
         numerical_dim = preprocess_result['numerical_dim']
         feature_names = preprocess_result['feature_names']
+        stage_rates = preprocess_result.get('stage_rates', {})
 
         # Store preprocessing metadata
         results['preprocessing'] = {
             'categorical_dims': categorical_dims,
             'numerical_dim': numerical_dim,
             'feature_names': feature_names,
-            'num_subsets': len(subsets_list)
+            'num_subsets': len(subsets_list),
+            'stage_rates': stage_rates
         }
 
         # Train on each subset
@@ -805,6 +954,65 @@ def create_seed_summary(all_seeds_results, output_path):
                         ])
     
     print(f"Summary of all seed runs saved to {output_path}")
+
+
+def perform_stage_specific_analysis(model, train_dataset, test_dataset, args, device, feature_names, subset_label="single"):
+    """
+    Perform stage-specific analysis including clustering for better interpretability.
+    """
+    print("\n" + "="*80)
+    print(f"PERFORMING STAGE-SPECIFIC ANALYSIS FOR {subset_label}")
+    print("="*80)
+    
+    # Create separate dataloaders for clarity
+    train_loader = DataLoader(train_dataset, batch_size=min(1024, len(train_dataset)), shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=min(1024, len(test_dataset)), shuffle=False)
+    
+    # Analyze each stage
+    stages = ['toured', 'applied', 'rented']
+    n_clusters = args.n_clusters if hasattr(args, 'n_clusters') else 8
+    use_umap = not getattr(args, 'skip_umap', False)  # Use UMAP unless explicitly skipped
+    
+    results = {}
+    
+    # Run clustering on each stage using test set
+    for stage in stages:
+        print(f"\nAnalyzing {stage.upper()} stage:")
+        cluster_results = perform_stage_specific_clustering(
+            test_loader, 
+            model, 
+            device,
+            n_clusters=n_clusters,
+            stage=stage,
+            use_umap=use_umap,
+            random_state=args.seed
+        )
+        
+        # Save results
+        results[stage] = cluster_results
+        
+        # If we have plot bytes, save them as an image
+        if cluster_results['plot_bytes']:
+            cluster_dir = os.path.join(args.output_dir, 'clusters')
+            os.makedirs(cluster_dir, exist_ok=True)
+            plot_path = os.path.join(cluster_dir, f"{subset_label}_{stage}_clusters.png")
+            
+            with open(plot_path, 'wb') as f:
+                f.write(cluster_results['plot_bytes'])
+            print(f"Saved cluster visualization to {plot_path}")
+        
+        # Print some stats about the clusters
+        print(f"Created {cluster_results['n_clusters']} clusters for {stage} stage")
+        print("Cluster sizes:")
+        for i, count in cluster_results['cluster_counts'].items():
+            print(f"  - Cluster {i}: {count} leads")
+    
+    # Save all results
+    analysis_path = os.path.join(args.output_dir, f"{subset_label}_stage_analysis.joblib")
+    joblib.dump(results, analysis_path)
+    print(f"\nSaved stage analysis results to {analysis_path}")
+    
+    return results
 
 
 def main():

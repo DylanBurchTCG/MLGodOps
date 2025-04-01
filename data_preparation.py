@@ -29,10 +29,13 @@ def preprocess_data(
 ):
     """
     Preprocess the lead data for the neural network model.
-    Starting with 2000 leads, the model will:
-    1. Predict which 1000 are most likely to tour
-    2. From those 1000, predict which 500 are most likely to apply
-    3. From those 500, predict which 250 are most likely to rent
+    
+    The model can use either fixed counts or percentage-based selection:
+    - Fixed counts: Select top k leads at each stage (e.g., 2000→1000→500→250)
+    - Percentage-based: Select top p% of leads at each stage based on data distribution
+    - Adaptive: Automatically determine percentages based on actual rates in the data
+    
+    This function handles data cleaning, feature engineering, and train/test splitting.
     """
     print("\n" + "="*80)
     print("DATA PREPARATION PIPELINE")
@@ -83,6 +86,22 @@ def preprocess_data(
     print(f"* TOURED:  {y_toured.mean() * 100:>6.2f}% positive ({y_toured.sum():,} of {len(y_toured):,})")
     print(f"* APPLIED: {y_applied.mean() * 100:>6.2f}% positive ({y_applied.sum():,} of {len(y_applied):,})")
     print(f"* RENTED:  {y_rent.mean() * 100:>6.2f}% positive ({y_rent.sum():,} of {len(y_rent):,})")
+
+    # Calculate stage progression rates for adaptive thresholds
+    stage_rates = {
+        'toured_rate': y_toured.mean(),
+        'applied_rate': y_applied.mean(),
+        'rented_rate': y_rent.mean(),
+        # Add conditional rates if possible
+        'applied_given_toured': y_applied[y_toured == 1].mean() if y_toured.sum() > 0 else 0,
+        'rented_given_applied': y_rent[y_applied == 1].mean() if y_applied.sum() > 0 else 0
+    }
+    print("\nStage Progression Rates (for adaptive thresholds):")
+    print(f"* Overall toured rate: {stage_rates['toured_rate']*100:.2f}%")
+    print(f"* Overall applied rate: {stage_rates['applied_rate']*100:.2f}%")
+    print(f"* Overall rented rate: {stage_rates['rented_rate']*100:.2f}%")
+    print(f"* Applied rate among toured leads: {stage_rates['applied_given_toured']*100:.2f}%")
+    print(f"* Rented rate among applied leads: {stage_rates['rented_given_applied']*100:.2f}%")
 
     print("\n4. Feature Engineering...")
     print("-"*40)
@@ -329,7 +348,7 @@ def preprocess_data(
             print(f"* RENTED:  {torch.mean(rented_labels).item() * 100:>6.2f}% positive")
             print("\n" + "="*80 + "\n")
 
-            # Save preprocessors (only from the single run)
+            # Save preprocessors if requested
             if save_preprocessors:
                 if not os.path.exists(preprocessors_path):
                     os.makedirs(preprocessors_path)
@@ -339,14 +358,15 @@ def preprocess_data(
                     'scaler': scaler_obj,
                     'categorical_cols': categorical_cols,
                     'numerical_cols': numerical_cols,
-                    'feature_names': feat_names
+                    'feature_names': feat_names,
+                    'stage_rates': stage_rates
                 }
 
                 # Use joblib instead of pickle
                 joblib.dump(preprocessors, os.path.join(preprocessors_path, 'preprocessors.joblib'))
                 print(f"Saved preprocessors to {os.path.join(preprocessors_path, 'preprocessors.joblib')}")
 
-            return train_dataset, test_dataset, cat_dims, num_dim, feat_names
+            return train_dataset, test_dataset, cat_dims, num_dim, feat_names, stage_rates
 
         except Exception as e:
             print(f"Error in preprocessing: {str(e)}")
@@ -439,7 +459,8 @@ def preprocess_data(
                 'scaler': scaler_obj,
                 'categorical_cols': categorical_cols,
                 'numerical_cols': numerical_cols,
-                'feature_names': feat_names
+                'feature_names': feat_names,
+                'stage_rates': stage_rates  # Include stage rates
             }
 
             # Use joblib instead of pickle
@@ -455,7 +476,8 @@ def preprocess_data(
             'subsets': subsets_list,
             'categorical_dims': cat_dims,
             'numerical_dim': num_dim,
-            'feature_names': feat_names
+            'feature_names': feat_names,
+            'stage_rates': stage_rates  # Include stage rates
         }
 
 
