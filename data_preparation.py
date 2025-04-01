@@ -23,42 +23,16 @@ def preprocess_data(
         max_categories=100,
         save_preprocessors=True,
         preprocessors_path='./preprocessors',
-        # NEW PARAMS FOR MULTIPLE SUBSETS
         num_subsets=1,  # How many subsets to create (default=1 => no subsets, just entire data)
-        subset_size=2000,  # Size of each subset if doing multiple subsets (default 2k)
-        balance_classes=False  # Whether to attempt balancing (for RENTED) in each subset
+        subset_size=2000,  # Size of each subset (default 2k for initial selection)
+        balance_classes=False  # Whether to attempt balancing in each subset
 ):
     """
     Preprocess the lead data for the neural network model.
-
-    Optionally, create multiple subsets (e.g., 10 subsets of 1k leads each),
-    possibly balanced on the rarest outcome (TOTAL_RENTED).
-
-    Args:
-        data_path: Path to the CSV file containing lead data.
-        dict_path: Path to data dictionary CSV (optional).
-        dict_map_path: Path to data dictionary mapping CSV (optional).
-        target_cols: List of columns [toured_col, applied_col, rented_col].
-        test_size: Fraction of data to use for testing.
-        random_state: Random seed for reproducibility.
-        max_categories: Maximum number of categories for a column to be treated as categorical.
-        save_preprocessors: Whether to save preprocessors for later use.
-        preprocessors_path: Directory to save preprocessors.
-        num_subsets: How many subsets to create. If >1, we sample multiple times from the dataset.
-        subset_size: Size (row count) for each subset.
-        balance_classes: If True, attempt to balance on the 'rented' target in each subset.
-
-    Returns:
-        If num_subsets == 1:
-            (train_dataset, test_dataset, categorical_dims, numerical_dim, feature_names)
-        If num_subsets > 1:
-            A dictionary of form:
-            {
-                'subsets': [ (train_dataset_i, test_dataset_i), (train_dataset_j, test_dataset_j), ... ],
-                'categorical_dims': ...,
-                'numerical_dim': ...,
-                'feature_names': ...
-            }
+    Starting with 2000 leads, the model will:
+    1. Predict which 1000 are most likely to tour
+    2. From those 1000, predict which 500 are most likely to apply
+    3. From those 500, predict which 250 are most likely to rent
     """
     print("\n" + "="*80)
     print("DATA PREPARATION PIPELINE")
@@ -67,8 +41,8 @@ def preprocess_data(
     print("\n1. Loading Data...")
     print("-"*40)
     try:
-        data = pd.read_csv(data_path, low_memory=False)  # Added low_memory=False to avoid dtype warning
-        print(f"✓ Loaded data with {len(data):,} rows and {len(data.columns):,} columns")
+        data = pd.read_csv(data_path, low_memory=False)
+        print(f"* Loaded data with {len(data):,} rows and {len(data.columns):,} columns")
     except Exception as e:
         raise ValueError(f"Error loading data from {data_path}: {str(e)}")
 
@@ -79,7 +53,7 @@ def preprocess_data(
         print("-"*40)
         try:
             data_dict = pd.read_csv(dict_path)
-            print(f"✓ Loaded dictionary with {len(data_dict):,} entries")
+            print(f"* Loaded dictionary with {len(data_dict):,} entries")
         except Exception as e:
             print(f"Warning: Could not load data dictionary from {dict_path}: {str(e)}")
 
@@ -106,9 +80,9 @@ def preprocess_data(
     y_rent = (data[target_cols[2]] > 0).astype(int)
 
     print("Target Distributions:")
-    print(f"✓ TOURED:  {y_toured.mean() * 100:>6.2f}% positive ({y_toured.sum():,} of {len(y_toured):,})")
-    print(f"✓ APPLIED: {y_applied.mean() * 100:>6.2f}% positive ({y_applied.sum():,} of {len(y_applied):,})")
-    print(f"✓ RENTED:  {y_rent.mean() * 100:>6.2f}% positive ({y_rent.sum():,} of {len(y_rent):,})")
+    print(f"* TOURED:  {y_toured.mean() * 100:>6.2f}% positive ({y_toured.sum():,} of {len(y_toured):,})")
+    print(f"* APPLIED: {y_applied.mean() * 100:>6.2f}% positive ({y_applied.sum():,} of {len(y_applied):,})")
+    print(f"* RENTED:  {y_rent.mean() * 100:>6.2f}% positive ({y_rent.sum():,} of {len(y_rent):,})")
 
     print("\n4. Feature Engineering...")
     print("-"*40)
@@ -119,7 +93,7 @@ def preprocess_data(
         for keyword in lead_keywords:
             matching_fields = data_dict[data_dict['LONG_DESCRIPTION'].str.contains(keyword, case=False, na=False)]
             important_cols.extend(matching_fields['FIELD_NAME'].tolist())
-        print(f"✓ Identified {len(important_cols)} potentially important columns from data dictionary")
+        print(f"* Identified {len(important_cols)} potentially important columns from data dictionary")
 
     # Drop target columns from the feature set
     print("\n5. Feature Selection...")
@@ -144,7 +118,7 @@ def preprocess_data(
     missing_pct = X.isnull().mean()
     cols_to_drop_missing = missing_pct[missing_pct > 0.95].index
     X = X.drop(cols_to_drop_missing, axis=1)
-    print(f"✓ Dropped {len(cols_to_drop_missing)} columns with >95% missing values")
+    print(f"* Dropped {len(cols_to_drop_missing)} columns with >95% missing values")
 
     # Separate ID column if it exists
     if 'CLIENT_PERSON_ID' in X.columns:
@@ -152,7 +126,7 @@ def preprocess_data(
         X = X.drop('CLIENT_PERSON_ID', axis=1)
     else:
         lead_ids = pd.Series(np.arange(len(X)))
-        print("✓ No CLIENT_PERSON_ID found, creating sequential IDs")
+        print("* No CLIENT_PERSON_ID found, creating sequential IDs")
 
     # Identify categorical vs numerical columns
     categorical_cols = []
@@ -164,7 +138,7 @@ def preprocess_data(
         elif X[col].dtype in ['int64', 'float64']:
             numerical_cols.append(col)
 
-    print(f"✓ Identified {len(categorical_cols)} categorical columns and {len(numerical_cols)} numerical columns")
+    print(f"* Identified {len(categorical_cols)} categorical columns and {len(numerical_cols)} numerical columns")
 
     print("\n6. Handling Missing Values...")
     print("-"*40)
@@ -333,6 +307,7 @@ def preprocess_data(
     if num_subsets <= 1:
         print("\n7. Train/Test Split...")
         print("-"*40)
+        print("Cascade Flow: 2000 leads -> 1000 toured -> 500 applied -> 250 rented")
         torch.multiprocessing.set_sharing_strategy('file_system')
 
         try:
@@ -340,8 +315,8 @@ def preprocess_data(
                 categorical_data, numerical_data, y_toured, y_applied, y_rent, lead_ids
             )
 
-            print(f"✓ Training set: {len(train_dataset):,} samples")
-            print(f"✓ Testing set:  {len(test_dataset):,} samples")
+            print(f"* Training set: {len(train_dataset):,} samples")
+            print(f"* Testing set:  {len(test_dataset):,} samples")
 
             print("\n8. Final Class Distribution (Train Set):")
             print("-"*40)
@@ -349,9 +324,9 @@ def preprocess_data(
             applied_labels = torch.stack([item[3] for item in train_dataset])
             rented_labels = torch.stack([item[4] for item in train_dataset])
             
-            print(f"✓ TOURED:  {torch.mean(toured_labels).item() * 100:>6.2f}% positive")
-            print(f"✓ APPLIED: {torch.mean(applied_labels).item() * 100:>6.2f}% positive")
-            print(f"✓ RENTED:  {torch.mean(rented_labels).item() * 100:>6.2f}% positive")
+            print(f"* TOURED:  {torch.mean(toured_labels).item() * 100:>6.2f}% positive")
+            print(f"* APPLIED: {torch.mean(applied_labels).item() * 100:>6.2f}% positive")
+            print(f"* RENTED:  {torch.mean(rented_labels).item() * 100:>6.2f}% positive")
             print("\n" + "="*80 + "\n")
 
             # Save preprocessors (only from the single run)

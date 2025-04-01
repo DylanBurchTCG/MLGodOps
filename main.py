@@ -32,7 +32,6 @@ def parse_args():
 
     parser.add_argument('--mixed_precision', action='store_true',
                         help='Use mixed precision training (faster on newer GPUs)')
-    # Updated batch size and gradient accumulation for the cascade
     parser.add_argument('--gradient_accum', type=int, default=8,
                         help='Gradient accumulation steps (use higher values for larger batch sizes)')
     parser.add_argument('--batch_size', type=int, default=2000, help='Batch size for training')
@@ -40,9 +39,9 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
 
     # Updated cascade parameters for 2k -> 1k -> 500 -> 250 flow
-    parser.add_argument('--toured_k', type=int, default=2000, help='Number of leads to select at toured stage')
-    parser.add_argument('--applied_k', type=int, default=1000, help='Number of leads to select at applied stage')
-    parser.add_argument('--rented_k', type=int, default=250, help='Number of leads to select at rented stage')
+    parser.add_argument('--toured_k', type=int, default=1000, help='Number of leads to select at toured stage (from 2000)')
+    parser.add_argument('--applied_k', type=int, default=500, help='Number of leads to select at applied stage (from 1000)')
+    parser.add_argument('--rented_k', type=int, default=250, help='Number of leads to select at rented stage (from 500)')
 
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--seeds', type=str, default=None, help='Comma-separated list of seeds to run with')
@@ -60,10 +59,10 @@ def parse_args():
     # NEW ARGS for multiple subsets
     parser.add_argument('--num_subsets', type=int, default=1,
                         help='How many subsets to create from the data')
-    parser.add_argument('--subset_size', type=int, default=1000,
-                        help='Size (row count) of each subset if num_subsets>1')
+    parser.add_argument('--subset_size', type=int, default=2000,
+                        help='Initial size of each subset (default 2000 leads)')
     parser.add_argument('--balance_classes', type=bool, default=False,
-                        help='Whether to balance on the rented label in each subset')
+                        help='Whether to balance classes in each subset')
 
     return parser.parse_args()
 
