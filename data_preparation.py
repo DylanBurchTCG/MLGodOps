@@ -25,7 +25,7 @@ def preprocess_data(
         preprocessors_path='./preprocessors',
         # NEW PARAMS FOR MULTIPLE SUBSETS
         num_subsets=1,  # How many subsets to create (default=1 => no subsets, just entire data)
-        subset_size=1000,  # Size of each subset if doing multiple subsets
+        subset_size=2000,  # Size of each subset if doing multiple subsets (default 2k)
         balance_classes=False  # Whether to attempt balancing (for RENTED) in each subset
 ):
     """
@@ -345,11 +345,15 @@ def preprocess_data(
             print(f"Training set: {len(train_dataset)} samples")
             print(f"Testing set:  {len(test_dataset)} samples")
 
-            # Print brief stats on class distribution
+            # Print brief stats on class distribution - FIXED ACCESS
             print(f"Train set class distribution:")
-            print(f"  Toured: {torch.mean(train_dataset[2]).item() * 100:.2f}% positive")
-            print(f"  Applied: {torch.mean(train_dataset[3]).item() * 100:.2f}% positive")
-            print(f"  Rented: {torch.mean(train_dataset[4]).item() * 100:.2f}% positive")
+            toured_labels = torch.stack([item[2] for item in train_dataset])
+            applied_labels = torch.stack([item[3] for item in train_dataset])
+            rented_labels = torch.stack([item[4] for item in train_dataset])
+            
+            print(f"  Toured: {torch.mean(toured_labels).item() * 100:.2f}% positive")
+            print(f"  Applied: {torch.mean(applied_labels).item() * 100:.2f}% positive")
+            print(f"  Rented: {torch.mean(rented_labels).item() * 100:.2f}% positive")
 
             # Save preprocessors (only from the single run)
             if save_preprocessors:
@@ -409,7 +413,7 @@ def preprocess_data(
             try:
                 if balance_classes:
                     # Modified: Calculate target number of rented=1 examples (target: 12.5%)
-                    target_rented_count = int(subset_size * 0.125)  # 125 out of 1000
+                    target_rented_count = int(subset_size * 0.125)  # 250 out of 2000
                     sample_1 = rented_1_df.sample(n=min(target_rented_count, len(rented_1_df)),
                                                   replace=False,
                                                   random_state=rng.randint(0, 999999))
