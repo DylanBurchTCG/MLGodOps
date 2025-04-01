@@ -621,14 +621,17 @@ def train_model(model,
         history['applied_p50'].append(applied_p50)
         history['rented_p50'].append(rented_p50)
 
-        print(f"Epoch {epoch + 1}/{num_epochs}")
+        # Print metrics with clear formatting and line breaks
+        print(f"\nEpoch {epoch + 1}/{num_epochs}")
+        print("-" * 80)
         print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
-        print(
-            f"Toured  => AUC: {toured_auc:.4f}, APR: {toured_apr:.4f}, P@10: {toured_p10:.4f}, P@50: {toured_p50:.4f}")
-        print(
-            f"Applied => AUC: {applied_auc:.4f}, APR: {applied_apr:.4f}, P@10: {applied_p10:.4f}, P@50: {applied_p50:.4f}")
-        print(
-            f"Rented  => AUC: {rented_auc:.4f}, APR: {rented_apr:.4f}, P@10: {rented_p10:.4f}, P@50: {rented_p50:.4f}")
+        print("\nMetrics:")
+        print(f"{'Stage':<10} {'AUC':<10} {'APR':<10} {'P@10':<10} {'P@50':<10}")
+        print("-" * 80)
+        print(f"{'Toured':<10} {toured_auc:.4f}     {toured_apr:.4f}     {toured_p10:.4f}     {toured_p50:.4f}")
+        print(f"{'Applied':<10} {applied_auc:.4f}     {applied_apr:.4f}     {applied_p10:.4f}     {applied_p50:.4f}")
+        print(f"{'Rented':<10} {rented_auc:.4f}     {rented_apr:.4f}     {rented_p10:.4f}     {rented_p50:.4f}")
+        print("-" * 80 + "\n")
 
         # Step LR scheduler
         scheduler.step(val_loss)

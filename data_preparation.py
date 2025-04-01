@@ -60,23 +60,28 @@ def preprocess_data(
                 'feature_names': ...
             }
     """
-    print("Loading data...")
+    print("\n" + "="*80)
+    print("DATA PREPARATION PIPELINE")
+    print("="*80)
+    
+    print("\n1. Loading Data...")
+    print("-"*40)
     try:
-        data = pd.read_csv(data_path)
-        print(f"Loaded data with {len(data)} rows and {len(data.columns)} columns")
+        data = pd.read_csv(data_path, low_memory=False)  # Added low_memory=False to avoid dtype warning
+        print(f"✓ Loaded data with {len(data):,} rows and {len(data.columns):,} columns")
     except Exception as e:
         raise ValueError(f"Error loading data from {data_path}: {str(e)}")
 
     # Load data dictionary if provided
     data_dict = None
     if dict_path and os.path.exists(dict_path):
-        print("Loading data dictionary...")
+        print("\n2. Loading Data Dictionary...")
+        print("-"*40)
         try:
             data_dict = pd.read_csv(dict_path)
-            print(f"Loaded dictionary with {len(data_dict)} entries")
+            print(f"✓ Loaded dictionary with {len(data_dict):,} entries")
         except Exception as e:
             print(f"Warning: Could not load data dictionary from {dict_path}: {str(e)}")
-            # Continue without data dictionary
 
     # Load dictionary mapping if provided
     dict_map = None
@@ -89,90 +94,82 @@ def preprocess_data(
             print(f"Warning: Could not load dictionary mapping from {dict_map_path}: {str(e)}")
             # Continue without dictionary mapping
 
-    # Create binary target variables
-    print("Creating target variables...")
-    # Check if target columns exist in the dataset
+    print("\n3. Creating Target Variables...")
+    print("-"*40)
+    # Check for required target columns
     for col in target_cols:
         if col not in data.columns:
-            raise ValueError(
-                f"Target column '{col}' not found in dataset. "
-                f"Available columns: {', '.join(data.columns[:10])}..."
-            )
+            raise ValueError(f"Target column '{col}' not found in dataset.")
 
-    # Example: y_toured, y_applied, y_rent for each row
     y_toured = (data[target_cols[0]] > 0).astype(int)
     y_applied = (data[target_cols[1]] > 0).astype(int)
     y_rent = (data[target_cols[2]] > 0).astype(int)
 
-    # Print distribution of target variables
-    print(f"\nTarget distributions:")
-    print(f"TOURED: {y_toured.mean() * 100:.2f}% positive ({y_toured.sum()} of {len(y_toured)})")
-    print(f"APPLIED: {y_applied.mean() * 100:.2f}% positive ({y_applied.sum()} of {len(y_applied)})")
-    print(f"RENTED: {y_rent.mean() * 100:.2f}% positive ({y_rent.sum()} of {len(y_rent)})")
+    print("Target Distributions:")
+    print(f"✓ TOURED:  {y_toured.mean() * 100:>6.2f}% positive ({y_toured.sum():,} of {len(y_toured):,})")
+    print(f"✓ APPLIED: {y_applied.mean() * 100:>6.2f}% positive ({y_applied.sum():,} of {len(y_applied):,})")
+    print(f"✓ RENTED:  {y_rent.mean() * 100:>6.2f}% positive ({y_rent.sum():,} of {len(y_rent):,})")
 
+    print("\n4. Feature Engineering...")
+    print("-"*40)
     # Use data dictionary to find "important columns" if wanted
     important_cols = []
     if data_dict is not None:
-        # Find columns that might be relevant (this is optional logic)
         lead_keywords = ['lead', 'customer', 'client', 'property', 'apartment', 'rent', 'tour', 'visit']
         for keyword in lead_keywords:
             matching_fields = data_dict[data_dict['LONG_DESCRIPTION'].str.contains(keyword, case=False, na=False)]
             important_cols.extend(matching_fields['FIELD_NAME'].tolist())
-
-        print(f"Identified {len(important_cols)} potentially important columns from data dictionary")
+        print(f"✓ Identified {len(important_cols)} potentially important columns from data dictionary")
 
     # Drop target columns from the feature set
-    print("Preparing feature set...")
+    print("\n5. Feature Selection...")
+    print("-"*40)
     X = data.drop(target_cols, axis=1)
 
-    # Drop specified columns (IDs, strings we know we don't need, etc.)
+    # Drop specified columns
     cols_to_drop = [
         "HASH", "RECD_LUID", "RECD_P_ID", "RECD_A_ID", "CLIENT_PERSON_ID", "CLIENT_ID", "RN",
         "FNAM_FNAM", "MNAM_MNAM", "PFXT_PFXT", "SNAM_SNAM", "SFXT_SFXT", "FIRST_NAME", "LAST_NAME", "EMAIL", "PHONE",
         "ADDRESS_LINE_1", "ADDRESS_LINE_2", "CITY", "STRT_NAME_I1", "STRT_POST_I1", "STRT_PRED_I1", "STRT_SUFX_I1",
-        "QUALIFIED",
-        "EXTRACT_DATE", "NCOA_MOVE_UPDATE_DATE", "NCOA_MOVE_UPDATE_METHOD_CODE",
+        "QUALIFIED", "EXTRACT_DATE", "NCOA_MOVE_UPDATE_DATE", "NCOA_MOVE_UPDATE_METHOD_CODE",
         "EST_CURRENT_MORTGAGE_AMOUNT", "ENRICHMENTESTIMATED_CURRENT_MORTGAGE_AMT", "EST_MONTHLY_MORTGAGE_PAYMENT",
         "EST_CURRENT_LOAN-TO-VALUE_RATIO", "EST_AVAILABLE_EQUITY_LL", "ESTIMATED_AVAILABLE_EQUITY",
         "EQTY_LNDR_I1", "MORT_LNDR_I1", "REFI_LNDR_I1",
         "GROUP_ID", "GROUP_NAME", "LEAD_CREATED_AT", "CITY_PLAC_I1", "COUNTY_CODE_I1", "STATE_ABBR_I1", "STATE_I1",
-        "RECD_ZIPC_I1",
-        "SCDY_NUMB_I1", "SCDY_DESG_I1", "INVS_TYPE_I1", "PRCH_TYPE_I1",
-        "TOTAL_WALK_IN"  # Example of "meaningless" column
+        "RECD_ZIPC_I1", "SCDY_NUMB_I1", "SCDY_DESG_I1", "INVS_TYPE_I1", "PRCH_TYPE_I1", "TOTAL_WALK_IN"
     ]
     X = X.drop(columns=[col for col in cols_to_drop if col in X.columns], errors='ignore')
 
-    # Remove any columns with >95% missing values
+    # Remove columns with >95% missing values
     missing_pct = X.isnull().mean()
     cols_to_drop_missing = missing_pct[missing_pct > 0.95].index
     X = X.drop(cols_to_drop_missing, axis=1)
-    print(f"Dropped {len(cols_to_drop_missing)} columns with >95% missing values")
+    print(f"✓ Dropped {len(cols_to_drop_missing)} columns with >95% missing values")
 
     # Separate ID column if it exists
     if 'CLIENT_PERSON_ID' in X.columns:
         lead_ids = X['CLIENT_PERSON_ID'].copy()
         X = X.drop('CLIENT_PERSON_ID', axis=1)
     else:
-        # If there's no ID column, we'll just create our own
         lead_ids = pd.Series(np.arange(len(X)))
-        print("No CLIENT_PERSON_ID found, creating sequential IDs")
+        print("✓ No CLIENT_PERSON_ID found, creating sequential IDs")
 
-    # Identify which columns are categorical vs numerical
+    # Identify categorical vs numerical columns
     categorical_cols = []
     numerical_cols = []
     for col in X.columns:
-        # We consider object columns or numeric columns with <max_categories unique values as categorical
         if X[col].dtype == 'object' or (X[col].dtype in ['int64', 'float64'] and X[col].nunique() < 20):
             if X[col].nunique() <= max_categories:
                 categorical_cols.append(col)
         elif X[col].dtype in ['int64', 'float64']:
             numerical_cols.append(col)
 
-    print(f"Identified {len(categorical_cols)} categorical columns and {len(numerical_cols)} numerical columns")
+    print(f"✓ Identified {len(categorical_cols)} categorical columns and {len(numerical_cols)} numerical columns")
 
+    print("\n6. Handling Missing Values...")
+    print("-"*40)
     # Handle missing values
     # For numerical: impute with median
-    print("Handling missing values...")
     numerical_data = X[numerical_cols].copy()
 
     # Check for columns with all missing values
@@ -334,7 +331,8 @@ def preprocess_data(
 
     # -------------- If num_subsets == 1, just do the entire dataset --------------
     if num_subsets <= 1:
-        print("Splitting into train/test sets (single run)...")
+        print("\n7. Train/Test Split...")
+        print("-"*40)
         torch.multiprocessing.set_sharing_strategy('file_system')
 
         try:
@@ -342,18 +340,19 @@ def preprocess_data(
                 categorical_data, numerical_data, y_toured, y_applied, y_rent, lead_ids
             )
 
-            print(f"Training set: {len(train_dataset)} samples")
-            print(f"Testing set:  {len(test_dataset)} samples")
+            print(f"✓ Training set: {len(train_dataset):,} samples")
+            print(f"✓ Testing set:  {len(test_dataset):,} samples")
 
-            # Print brief stats on class distribution - FIXED ACCESS
-            print(f"Train set class distribution:")
+            print("\n8. Final Class Distribution (Train Set):")
+            print("-"*40)
             toured_labels = torch.stack([item[2] for item in train_dataset])
             applied_labels = torch.stack([item[3] for item in train_dataset])
             rented_labels = torch.stack([item[4] for item in train_dataset])
             
-            print(f"  Toured: {torch.mean(toured_labels).item() * 100:.2f}% positive")
-            print(f"  Applied: {torch.mean(applied_labels).item() * 100:.2f}% positive")
-            print(f"  Rented: {torch.mean(rented_labels).item() * 100:.2f}% positive")
+            print(f"✓ TOURED:  {torch.mean(toured_labels).item() * 100:>6.2f}% positive")
+            print(f"✓ APPLIED: {torch.mean(applied_labels).item() * 100:>6.2f}% positive")
+            print(f"✓ RENTED:  {torch.mean(rented_labels).item() * 100:>6.2f}% positive")
+            print("\n" + "="*80 + "\n")
 
             # Save preprocessors (only from the single run)
             if save_preprocessors:
