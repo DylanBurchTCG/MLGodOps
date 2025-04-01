@@ -56,13 +56,22 @@ class LeadDataset(Dataset):
 # ----------------
 def rank_leads_multi_stage(model, dataloader,
                            toured_k=2000, applied_k=1000, rented_k=250,
+                           use_percentages=False, toured_pct=0.5, applied_pct=0.5, rented_pct=0.5,
                            device='cuda'):
     """
     Ranks leads in a funnel:
-     1) Sort by Toured prob => top K
-     2) Among them, sort by Applied prob => top K
-     3) Among them, sort by Rented prob => top K
+     1) Sort by Toured prob => top K or top percentage
+     2) Among them, sort by Applied prob => top K or top percentage
+     3) Among them, sort by Rented prob => top K or top percentage
     Returns a dict with selected IDs and excluded IDs for each stage.
+    
+    Args:
+        model: The trained model
+        dataloader: DataLoader containing the leads
+        toured_k, applied_k, rented_k: Fixed counts for selection at each stage
+        use_percentages: Whether to use percentage-based selection instead of fixed counts
+        toured_pct, applied_pct, rented_pct: Percentages to use for selection at each stage
+        device: Device to use for prediction
     """
     model.eval()
 
@@ -113,8 +122,15 @@ def rank_leads_multi_stage(model, dataloader,
             'rented': {'selected': np.array([]), 'scores': np.array([]), 'excluded': np.array([])}
         }
 
-    # Ensure k values don't exceed the dataset size
-    toured_k = min(toured_k, len(all_lead_ids))
+    # Stage 1: Toured - determine selection count
+    if use_percentages:
+        # Use percentage-based selection
+        toured_k = max(1, int(len(all_lead_ids) * toured_pct))
+        print(f"Using {toured_pct*100:.1f}% for toured stage: {toured_k} leads")
+    else:
+        # Use fixed count selection (with safety check)
+        toured_k = min(toured_k, len(all_lead_ids))
+        print(f"Using fixed count for toured stage: {toured_k} leads")
 
     # Stage 1: Toured
     toured_indices = np.argsort(all_toured_preds)[::-1][:toured_k]
@@ -124,8 +140,17 @@ def rank_leads_multi_stage(model, dataloader,
 
     print(f"Selected {len(toured_selected_ids)} out of {len(all_lead_ids)} leads for touring")
 
+    # Stage 2: Applied - determine selection count
+    if use_percentages:
+        # Use percentage-based selection
+        applied_k = max(1, int(len(toured_selected_ids) * applied_pct))
+        print(f"Using {applied_pct*100:.1f}% for applied stage: {applied_k} leads")
+    else:
+        # Use fixed count selection (with safety check)
+        applied_k = min(applied_k, len(toured_selected_ids))
+        print(f"Using fixed count for applied stage: {applied_k} leads")
+
     # Stage 2: Among the top Toured, rank by Applied
-    applied_k = min(applied_k, len(toured_selected_ids))
     applied_subset = all_applied_preds[toured_indices]
     applied_indices = np.argsort(applied_subset)[::-1][:applied_k]
     applied_selected_ids = toured_selected_ids[applied_indices]
@@ -134,8 +159,17 @@ def rank_leads_multi_stage(model, dataloader,
 
     print(f"Selected {len(applied_selected_ids)} out of {len(toured_selected_ids)} leads for applications")
 
+    # Stage 3: Rented - determine selection count
+    if use_percentages:
+        # Use percentage-based selection
+        rented_k = max(1, int(len(applied_selected_ids) * rented_pct))
+        print(f"Using {rented_pct*100:.1f}% for rented stage: {rented_k} leads")
+    else:
+        # Use fixed count selection (with safety check)
+        rented_k = min(rented_k, len(applied_selected_ids))
+        print(f"Using fixed count for rented stage: {rented_k} leads")
+
     # Stage 3: Among top Applied, rank by Rented
-    rented_k = min(rented_k, len(applied_selected_ids))
     rented_subset = all_rented_preds[toured_indices][applied_indices]
     rented_indices = np.argsort(rented_subset)[::-1][:rented_k]
     rented_selected_ids = applied_selected_ids[rented_indices]

@@ -26,7 +26,14 @@ def preprocess_data(
         num_subsets=1,  # How many subsets to create (default=1 => no subsets, just entire data)
         subset_size=2000,  # Size of each subset (default 2k for initial selection)
         balance_classes=False,  # Whether to attempt balancing in each subset
-        enhance_toured_features=True  # NEW: Add interaction features for toured stage
+        enhance_toured_features=True,  # NEW: Add interaction features for toured stage
+        use_percentages=False,
+        toured_pct=0.5,
+        applied_pct=0.5,
+        rented_pct=0.5,
+        toured_k=2000,
+        applied_k=2000,
+        rented_k=2000
 ):
     """
     Preprocess the lead data for the neural network model.
@@ -118,6 +125,9 @@ def preprocess_data(
     # NEW: Enhanced feature engineering for toured prediction
     if enhance_toured_features:
         print("\n4.1 Creating specialized features for toured prediction...")
+        
+        # Track initial column count for reporting
+        initial_column_count = len(data.columns)
         
         # Try to identify date columns
         date_columns = []
@@ -265,7 +275,9 @@ def preprocess_data(
         except:
             print("* Could not create some interaction features")
         
-        print(f"* Feature engineering complete - added {len(data.columns) - len(data.columns) - 10} new features")
+        # Calculate the actual number of new columns added
+        new_features_added = len(data.columns) - initial_column_count
+        print(f"* Feature engineering complete - added {new_features_added} new features")
 
     # Drop target columns from the feature set
     print("\n5. Feature Selection...")
@@ -481,7 +493,13 @@ def preprocess_data(
         print("-"*40)
         if enhance_toured_features:
             print("Enhanced feature engineering enabled for toured prediction")
-        print("Cascade Flow: 2000 leads -> 1000 toured -> 500 applied -> 250 rented")
+            
+        # Update this to show the correct flow based on percentage or fixed count selection
+        if use_percentages:
+            print(f"Using percentage-based selection: {toured_pct*100:.1f}% -> {applied_pct*100:.1f}% -> {rented_pct*100:.1f}%")
+        else:
+            print(f"Cascade Flow: {toured_k} leads -> {applied_k} toured -> {rented_k} applied -> rented")
+            
         torch.multiprocessing.set_sharing_strategy('file_system')
 
         try:

@@ -207,7 +207,17 @@ def enable_debug_mode(model):
         print(f"Toured pred shape: {toured_pred.shape}")
 
         # Continue with cascaded processing
-        _, toured_indices = torch.topk(toured_pred.squeeze(), min(self.toured_k, categorical_inputs.size(0)))
+        # Determine the number of leads to select based on method (percentage or fixed count)
+        if hasattr(self, 'use_percentages') and self.use_percentages:
+            # Use percentage-based selection
+            k_toured = max(1, int(categorical_inputs.size(0) * self.toured_pct))
+            print(f"Using percentage-based selection: {self.toured_pct*100:.1f}% = {k_toured} leads")
+        else:
+            # Use fixed count selection
+            k_toured = min(self.toured_k, categorical_inputs.size(0))
+            print(f"Using fixed count selection: k={k_toured} leads")
+            
+        _, toured_indices = torch.topk(toured_pred.squeeze(), k_toured)
         print(f"Selected {len(toured_indices)} leads after toured stage")
 
         # For multi-task model, use shared features
@@ -221,8 +231,17 @@ def enable_debug_mode(model):
         applied_pred_subset = self.applied_head(applied_features)
         print(f"Applied pred subset shape: {applied_pred_subset.shape}")
 
-        _, applied_indices_local = torch.topk(applied_pred_subset.squeeze(),
-                                              min(self.applied_k, len(toured_indices)))
+        # Determine applied selection count
+        if hasattr(self, 'use_percentages') and self.use_percentages:
+            # Use percentage-based selection
+            k_applied = max(1, int(len(toured_indices) * self.applied_pct))
+            print(f"Using percentage-based selection: {self.applied_pct*100:.1f}% = {k_applied} leads")
+        else:
+            # Use fixed count selection
+            k_applied = min(self.applied_k, len(toured_indices))
+            print(f"Using fixed count selection: k={k_applied} leads")
+            
+        _, applied_indices_local = torch.topk(applied_pred_subset.squeeze(), k_applied)
         print(f"Selected {len(applied_indices_local)} leads after applied stage")
 
         applied_indices = toured_indices[applied_indices_local]
@@ -237,6 +256,16 @@ def enable_debug_mode(model):
 
         rented_pred_subset = self.rented_head(rented_features)
         print(f"Rented pred subset shape: {rented_pred_subset.shape}")
+
+        # Determine rented selection count
+        if hasattr(self, 'use_percentages') and self.use_percentages:
+            # Use percentage-based selection
+            k_rented = max(1, int(len(applied_indices) * self.rented_pct))
+            print(f"Would select {k_rented} leads for rented stage ({self.rented_pct*100:.1f}%)")
+        else:
+            # Use fixed count selection
+            k_rented = min(self.rented_k, len(applied_indices))
+            print(f"Would select {k_rented} leads for rented stage (fixed count)")
 
         print(f"--- Finished debug forward pass ---\n")
 
@@ -888,11 +917,18 @@ def train_with_seed(args, seed=None):
     print(f"  - Seed: {args.seed}")
     print(f"  - Batch size: {args.batch_size}")
     print(f"  - Gradient accumulation: {args.gradient_accum}")
-    print(f"  - Toured k: {args.toured_k}")
-    print(f"  - Applied k: {args.applied_k}")
-    print(f"  - Rented k: {args.rented_k}")
+    
+    # Only show the selection method being used
+    if args.use_percentages:
+        print(f"  - Using percentage-based selection")
+        if args.adapt_to_data:
+            print(f"  - Adapting percentages to data distribution")
+        else:
+            print(f"  - Percentages: {args.toured_pct*100:.1f}% -> {args.applied_pct*100:.1f}% -> {args.rented_pct*100:.1f}%")
+    else:
+        print(f"  - Using fixed count selection: {args.toured_k} -> {args.applied_k} -> {args.rented_k}")
+        
     print(f"  - Enhanced toured features: {args.enhance_toured_features}")
-    print()
 
     # Preprocess data
     # This call can return either a single (train_ds, test_ds, cat_dims, num_dim, feat_names)
@@ -911,7 +947,16 @@ def train_with_seed(args, seed=None):
         num_subsets=args.num_subsets,
         subset_size=args.subset_size,
         balance_classes=args.balance_classes,
-        enhance_toured_features=args.enhance_toured_features,  # Pass the new parameter
+        enhance_toured_features=args.enhance_toured_features,
+        # Add percentage-based selection parameters
+        use_percentages=args.use_percentages,
+        toured_pct=args.toured_pct,
+        applied_pct=args.applied_pct,
+        rented_pct=args.rented_pct,
+        # Add fixed-count parameters too
+        toured_k=args.toured_k,
+        applied_k=args.applied_k,
+        rented_k=args.rented_k,
         random_state=args.seed
     )
 
