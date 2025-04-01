@@ -704,6 +704,7 @@ def perform_stage_specific_clustering(dataloader, model, device,
     """
     from sklearn.cluster import KMeans
     import matplotlib.pyplot as plt
+    from sklearn.metrics import silhouette_score
     
     # First, use the model to get predictions and select leads for the stage
     model.eval()
@@ -783,6 +784,28 @@ def perform_stage_specific_clustering(dataloader, model, device,
     else:
         raise ValueError(f"Unknown stage: {stage}")
     
+    # NEW: Add a diversity check - ensure we have balanced representation of leads
+    # For rented stage, make sure we also have some non-rented leads
+    if stage == 'rented':
+        # Sample some non-rented leads to ensure diversity in clustering
+        non_rented_mask = all_labels['applied'].flatten() > 0
+        non_rented_mask &= all_labels['rented'].flatten() == 0
+        
+        if np.sum(non_rented_mask) > 0:
+            print(f"Adding {min(len(stage_leads)//5, np.sum(non_rented_mask))} non-rented leads for more diverse clustering")
+            
+            # Take a sample of non-rented leads (up to 20% of the rented leads)
+            sample_size = min(len(stage_leads)//5, np.sum(non_rented_mask))
+            non_rented_indices = np.where(non_rented_mask)[0]
+            np.random.seed(random_state)
+            sampled_indices = np.random.choice(non_rented_indices, size=sample_size, replace=False)
+            
+            # Combine with rented leads
+            stage_leads = np.concatenate([stage_leads, all_lead_ids[sampled_indices]])
+            stage_features = np.concatenate([stage_features, all_features[sampled_indices]])
+            stage_labels = np.concatenate([stage_labels, all_labels['rented'][sampled_indices]])
+            stage_preds = np.concatenate([stage_preds, all_preds['rented'][sampled_indices]])
+    
     # Make sure we have enough leads for clustering
     if len(stage_leads) < n_clusters:
         print(f"Warning: Not enough leads ({len(stage_leads)}) for {n_clusters} clusters")
@@ -793,17 +816,70 @@ def perform_stage_specific_clustering(dataloader, model, device,
     if use_umap and stage_features.shape[1] > 50:
         try:
             import umap
-            reducer = umap.UMAP(random_state=random_state)
+            # NEW: Add more UMAP parameters for better visualization
+            reducer = umap.UMAP(
+                n_neighbors=30,
+                min_dist=0.1,
+                metric='euclidean',
+                random_state=random_state
+            )
             print(f"Reducing dimensionality from {stage_features.shape[1]} features using UMAP...")
             stage_features_reduced = reducer.fit_transform(stage_features)
+            
+            # Check if reduction was successful
+            if stage_features_reduced.shape[1] != 2:
+                print(f"Warning: UMAP returned {stage_features_reduced.shape[1]} dimensions instead of 2")
+                # Retry with different parameters if needed
+                if stage_features_reduced.shape[1] > 2:
+                    print("Retrying UMAP with different parameters...")
+                    reducer = umap.UMAP(n_components=2, random_state=random_state)
+                    stage_features_reduced = reducer.fit_transform(stage_features)
         except ImportError:
             print("UMAP not installed. Using original features.")
             stage_features_reduced = stage_features
+        except Exception as e:
+            print(f"UMAP error: {str(e)}. Using original features.")
+            stage_features_reduced = stage_features
     else:
-        stage_features_reduced = stage_features
+        # If we have too many features, use PCA instead
+        if stage_features.shape[1] > 100:
+            try:
+                from sklearn.decomposition import PCA
+                print(f"Using PCA to reduce {stage_features.shape[1]} features to 50...")
+                pca = PCA(n_components=50, random_state=random_state)
+                stage_features_reduced = pca.fit_transform(stage_features)
+            except Exception as e:
+                print(f"PCA error: {str(e)}. Using original features.")
+                stage_features_reduced = stage_features
+        else:
+            stage_features_reduced = stage_features
     
-    # Apply clustering
-    kmeans = KMeans(n_clusters=n_clusters, random_state=random_state)
+    # NEW: Determine optimal number of clusters
+    optimal_n_clusters = n_clusters
+    try:
+        from sklearn.metrics import silhouette_score
+        # Test a range of cluster counts if we have enough samples
+        if len(stage_features_reduced) > 3 * n_clusters:
+            print("Finding optimal number of clusters...")
+            silhouette_scores = []
+            cluster_range = range(2, min(15, n_clusters * 2, len(stage_features_reduced) // 10))
+            
+            for n in cluster_range:
+                kmeans = KMeans(n_clusters=n, random_state=random_state, n_init=10)
+                cluster_labels = kmeans.fit_predict(stage_features_reduced)
+                score = silhouette_score(stage_features_reduced, cluster_labels)
+                silhouette_scores.append(score)
+                print(f"  {n} clusters: silhouette score = {score:.4f}")
+            
+            # Find the best number of clusters
+            optimal_n_clusters = cluster_range[np.argmax(silhouette_scores)]
+            print(f"Optimal number of clusters: {optimal_n_clusters} (score: {max(silhouette_scores):.4f})")
+    except Exception as e:
+        print(f"Error finding optimal clusters: {str(e)}. Using original value ({n_clusters}).")
+    
+    # Apply clustering with optimal cluster count
+    n_clusters = optimal_n_clusters
+    kmeans = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=10)
     print(f"Clustering {len(stage_features_reduced)} leads into {n_clusters} clusters...")
     cluster_labels = kmeans.fit_predict(stage_features_reduced)
     
@@ -812,34 +888,96 @@ def perform_stage_specific_clustering(dataloader, model, device,
     for i in range(n_clusters):
         cluster_counts[i] = np.sum(cluster_labels == i)
     
-    # For rented stage, check if there's a cluster with significantly higher conversion rate
-    if stage == 'rented':
-        print("Analyzing rented stage clusters for conversion patterns...")
-        cluster_conversion_rates = {}
-        for i in range(n_clusters):
-            cluster_mask = cluster_labels == i
-            # Only calculate if we have at least 5 leads in the cluster
-            if np.sum(cluster_mask) >= 5:
-                cluster_conversion_rates[i] = np.mean(stage_labels[cluster_mask])
-        
-        if cluster_conversion_rates:
-            # Find highest conversion cluster
-            best_cluster = max(cluster_conversion_rates.items(), key=lambda x: x[1])
-            print(f"Cluster {best_cluster[0]} has highest conversion rate: {best_cluster[1]:.1%}")
+    # Analyze clusters for class distribution
+    print("\nAnalyzing cluster composition:")
+    cluster_conversion_rates = {}
+    cluster_stats = {}
     
-    # Create simple visualization if UMAP was used
-    if use_umap and stage_features_reduced.shape[1] == 2:
-        plt.figure(figsize=(10, 8))
-        plt.scatter(stage_features_reduced[:, 0], stage_features_reduced[:, 1], 
-                   c=cluster_labels, cmap='viridis', alpha=0.6)
+    for i in range(n_clusters):
+        cluster_mask = cluster_labels == i
+        # Only calculate if we have at least 5 leads in the cluster
+        if np.sum(cluster_mask) >= 5:
+            # Calculate the conversion rate for this cluster
+            conversion_rate = np.mean(stage_labels[cluster_mask])
+            cluster_conversion_rates[i] = conversion_rate
+            
+            # Store other stats
+            cluster_stats[i] = {
+                'size': np.sum(cluster_mask),
+                'conversion_rate': conversion_rate,
+                'positive_count': np.sum(stage_labels[cluster_mask]),
+                'avg_prediction': np.mean(stage_preds[cluster_mask])
+            }
+            
+            # Print summary
+            print(f"Cluster {i}: {np.sum(cluster_mask)} leads, " + 
+                  f"conversion: {conversion_rate:.1%}, " +
+                  f"avg prediction: {np.mean(stage_preds[cluster_mask]):.4f}")
+            
+    # Identify suspicious clusters (100% or 0% conversion)
+    suspicious_clusters = []
+    for i, stats in cluster_stats.items():
+        if stats['size'] > 5 and (stats['conversion_rate'] == 1.0 or stats['conversion_rate'] == 0.0):
+            suspicious_clusters.append(i)
+            print(f"WARNING: Cluster {i} has {stats['conversion_rate']*100:.0f}% conversion rate " +
+                  f"({stats['positive_count']}/{stats['size']} leads)")
+    
+    if suspicious_clusters:
+        print("\nDetected potentially suspicious clusters with extreme conversion rates.")
+        print("This could indicate:")
+        print("1. Perfect feature patterns that predict the outcome")
+        print("2. Data leakage - model using target information directly")
+        print("3. Overfitting in certain regions of feature space")
+        print("Consider checking feature importance and correlation with target.")
+    
+    # Create visualization based on dimensionality reduction method
+    if stage_features_reduced.shape[1] == 2:
+        plt.figure(figsize=(12, 10))
+        
+        # NEW: Better visualization with distinct colors for true labels
+        true_status = stage_labels.flatten() > 0.5
+        
+        # Plot clusters with different shapes
+        plt.scatter(stage_features_reduced[~true_status, 0], 
+                   stage_features_reduced[~true_status, 1],
+                   c=cluster_labels[~true_status], 
+                   marker='o',
+                   alpha=0.6, 
+                   cmap='tab20')
+        
+        plt.scatter(stage_features_reduced[true_status, 0], 
+                   stage_features_reduced[true_status, 1],
+                   c=cluster_labels[true_status], 
+                   marker='^',  # Use triangles for positive examples
+                   alpha=0.7, 
+                   cmap='tab20')
+        
+        # Mark centroids
+        centroids = kmeans.cluster_centers_
+        plt.scatter(centroids[:, 0], centroids[:, 1], 
+                   marker='x', s=150, linewidths=3,
+                   color='red', zorder=10)
+        
+        # Add annotations for conversion rates
+        for i, (x, y) in enumerate(centroids):
+            if i in cluster_conversion_rates:
+                plt.annotate(f"{i}: {cluster_conversion_rates[i]:.1%}", 
+                             (x, y), 
+                             xytext=(5, 5),
+                             textcoords='offset points',
+                             fontsize=12,
+                             bbox=dict(boxstyle='round,pad=0.3', fc='white', alpha=0.7),
+                             zorder=11)
+        
         plt.colorbar(label='Cluster')
-        plt.title(f'{stage.capitalize()} Stage Clustering')
+        plt.title(f'{stage.capitalize()} Stage Clustering\n' + 
+                 f'(^: {stage} positive, o: {stage} negative)')
         plt.tight_layout()
         
         # Save as bytes
         from io import BytesIO
         buf = BytesIO()
-        plt.savefig(buf, format='png')
+        plt.savefig(buf, format='png', dpi=120)
         buf.seek(0)
         plot_bytes = buf.getvalue()
         plt.close()
@@ -853,7 +991,151 @@ def perform_stage_specific_clustering(dataloader, model, device,
         'cluster_labels': cluster_labels,
         'centroids': kmeans.cluster_centers_,
         'cluster_counts': cluster_counts,
+        'cluster_stats': cluster_stats, 
+        'suspicious_clusters': suspicious_clusters,
         'plot_bytes': plot_bytes
     }
     
     return results
+
+
+def evaluate_cluster_specific_metrics(model, dataloader, cluster_assignments, device='cuda'):
+    """
+    Calculate metrics for each cluster to identify where the model performs well or poorly.
+    This helps pinpoint specific lead segments that need improvement.
+    
+    Args:
+        model: Trained model
+        dataloader: DataLoader with validation/test data
+        cluster_assignments: Dictionary mapping lead_ids to cluster labels
+        device: Device to use for prediction
+        
+    Returns:
+        Dictionary with metrics per cluster
+    """
+    from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_curve
+    
+    model.eval()
+    
+    # Collect predictions and labels per cluster
+    cluster_data = {}
+    
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Evaluating cluster metrics"):
+            cat_in = batch[0].to(device)
+            num_in = batch[1].to(device)
+            toured_labels = batch[2].cpu().numpy()
+            applied_labels = batch[3].cpu().numpy()
+            rented_labels = batch[4].cpu().numpy()
+            lead_ids = batch[5].cpu().numpy() if len(batch) > 5 else np.arange(len(cat_in))
+            
+            # Forward pass
+            outputs = model(cat_in, num_in)
+            if isinstance(outputs, tuple) and len(outputs) >= 3:
+                toured_pred, applied_pred, rented_pred = outputs[:3]
+            else:
+                toured_pred, applied_pred, rented_pred = outputs
+            
+            # Convert to numpy
+            toured_pred = toured_pred.cpu().numpy()
+            applied_pred = applied_pred.cpu().numpy()
+            rented_pred = rented_pred.cpu().numpy()
+            
+            # Find cluster for each lead
+            for i, lead_id in enumerate(lead_ids):
+                if lead_id in cluster_assignments:
+                    cluster = cluster_assignments[lead_id]
+                    
+                    # Initialize cluster data structure
+                    if cluster not in cluster_data:
+                        cluster_data[cluster] = {
+                            'toured_preds': [], 'toured_labels': [],
+                            'applied_preds': [], 'applied_labels': [],
+                            'rented_preds': [], 'rented_labels': [],
+                            'lead_ids': []
+                        }
+                    
+                    # Store predictions and labels
+                    cluster_data[cluster]['toured_preds'].append(toured_pred[i])
+                    cluster_data[cluster]['toured_labels'].append(toured_labels[i])
+                    cluster_data[cluster]['applied_preds'].append(applied_pred[i])
+                    cluster_data[cluster]['applied_labels'].append(applied_labels[i])
+                    cluster_data[cluster]['rented_preds'].append(rented_pred[i])
+                    cluster_data[cluster]['rented_labels'].append(rented_labels[i])
+                    cluster_data[cluster]['lead_ids'].append(lead_id)
+    
+    # Calculate metrics per cluster
+    cluster_metrics = {}
+    stages = ['toured', 'applied', 'rented']
+    
+    print("\nCluster-specific metrics:")
+    print("-" * 60)
+    print(f"{'Cluster':<8} {'Size':<6} {'Stage':<10} {'AUC':<8} {'APR':<8} {'P@10':<8}")
+    print("-" * 60)
+    
+    for cluster, data in sorted(cluster_data.items()):
+        cluster_metrics[cluster] = {}
+        
+        for stage in stages:
+            preds = np.array(data[f'{stage}_preds']).flatten()
+            labels = np.array(data[f'{stage}_labels']).flatten()
+            
+            # Skip clusters with too few samples or single class
+            if len(preds) < 10 or len(np.unique(labels)) < 2:
+                cluster_metrics[cluster][stage] = {
+                    'auc': np.nan, 'apr': np.nan, 'p@10': np.nan
+                }
+                continue
+            
+            # Calculate metrics
+            metrics = {
+                'auc': roc_auc_score(labels, preds),
+                'apr': average_precision_score(labels, preds)
+            }
+            
+            # Calculate precision@10
+            k = min(10, len(preds))
+            top_indices = np.argsort(preds)[-k:]
+            metrics['p@10'] = np.mean(labels[top_indices])
+            
+            cluster_metrics[cluster][stage] = metrics
+            
+            # Print metrics
+            print(f"{cluster:<8} {len(preds):<6} {stage:<10} "
+                  f"{metrics['auc']:<8.4f} {metrics['apr']:<8.4f} {metrics['p@10']:<8.4f}")
+    
+    # Aggregate summary: identify problematic segments
+    problem_clusters = {}
+    for stage in stages:
+        # Find clusters with below-average AUC
+        stage_aucs = [metrics[stage]['auc'] for cluster, metrics in cluster_metrics.items() 
+                     if not np.isnan(metrics[stage]['auc'])]
+        
+        if not stage_aucs:
+            continue
+            
+        avg_auc = np.mean(stage_aucs)
+        
+        # Identify poor performers
+        poor_clusters = [
+            (cluster, metrics[stage]['auc']) 
+            for cluster, metrics in cluster_metrics.items()
+            if not np.isnan(metrics[stage]['auc']) and metrics[stage]['auc'] < avg_auc * 0.9
+        ]
+        
+        if poor_clusters:
+            problem_clusters[stage] = sorted(poor_clusters, key=lambda x: x[1])
+    
+    # Print problem clusters
+    if problem_clusters:
+        print("\nProblem clusters requiring attention:")
+        for stage, clusters in problem_clusters.items():
+            print(f"\n{stage.capitalize()} stage:")
+            for cluster, auc in clusters:
+                size = len(cluster_data[cluster][f'{stage}_preds'])
+                print(f"  Cluster {cluster}: AUC={auc:.4f}, Size={size} leads")
+    
+    return {
+        'cluster_metrics': cluster_metrics,
+        'problem_clusters': problem_clusters
+    }

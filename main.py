@@ -85,6 +85,10 @@ def parse_args():
                         help='Number of clusters for stage-specific analysis')
     parser.add_argument('--skip_umap', action='store_true',
                         help='Skip UMAP dimension reduction for clustering')
+    
+    # NEW ARGS for feature engineering
+    parser.add_argument('--enhance_toured_features', action='store_true', default=True,
+                       help='Enable enhanced feature engineering for toured stage')
 
     return parser.parse_args()
 
@@ -569,9 +573,9 @@ def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_di
     embedding_dims = [min(50, (dim + 1) // 2) for dim in categorical_dims]
     total_feature_dim = sum(embedding_dims) + numerical_dim
 
-    # Ensure transformer_dim multiple of num_heads
-    transformer_dim = 256
-    num_heads = 4
+    # ENHANCED: Larger transformer dimensions for improved capacity
+    transformer_dim = 320  # Increased from 256
+    num_heads = 8  # Increased from 4
     if transformer_dim % num_heads != 0:
         transformer_dim = (transformer_dim // num_heads) * num_heads
 
@@ -600,7 +604,7 @@ def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_di
         num_heads=num_heads,
         ff_dim=512,
         head_hidden_dims=[128, 64],
-        dropout=0.2,
+        dropout=0.3,  # Increased dropout for better regularization
         toured_k=args.toured_k,
         applied_k=args.applied_k,
         rented_k=args.rented_k,
@@ -617,9 +621,24 @@ def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_di
     if args.debug:
         model = enable_debug_mode(model)
 
+    # ENHANCED: Improved optimizer with weight decay and gradient clipping
     # Use a lower learning rate and clip gradients more aggressively
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=args.lr,
+        weight_decay=0.01,  # Add weight decay for regularization
+        eps=1e-8  # For numeric stability
+    )
+    
+    # Use a more robust scheduler with patience
+    scheduler = ReduceLROnPlateau(
+        optimizer, 
+        mode='min', 
+        factor=0.5, 
+        patience=4,  # Increased from 3
+        verbose=True,
+        min_lr=1e-6
+    )
 
     # Temporarily create model file for train_cascaded_model
     # We'll delete this file later after loading its contents
@@ -639,10 +658,16 @@ def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_di
     print(f"  - Batch size: {effective_batch_size}")
     print(f"  - Gradient accumulation: {args.gradient_accum}")
     print(f"  - Mixed precision: {args.mixed_precision}")
-    print(f"  - Selection stages: {args.toured_k} -> {args.applied_k} -> {args.rented_k}")
+    
+    if args.use_percentages:
+        print(f"  - Selection percentages: {args.toured_pct*100:.1f}% -> {args.applied_pct*100:.1f}% -> {args.rented_pct*100:.1f}%")
+    else:
+        print(f"  - Selection stages: {args.toured_k} -> {args.applied_k} -> {args.rented_k}")
+    
     print(f"  - CSV output will be saved to {args.output_dir}\n")
 
     # Use the cascaded training function with ranking loss
+    # ENHANCED: Increased weight for toured stage to 3.0 (from 1.0)
     model, history = train_cascaded_model(
         model,
         train_loader,
@@ -650,10 +675,10 @@ def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_di
         optimizer,
         scheduler,
         num_epochs=args.epochs,
-        toured_weight=1.0,
+        toured_weight=3.0,  # Increased weight for toured stage
         applied_weight=1.0,
         rented_weight=2.0,
-        ranking_weight=0.3,  # Add 30% weight to ranking loss
+        ranking_weight=0.4,  # Increased from 0.3 to emphasize ranking performance
         device=device,
         model_save_path=temp_model_path,
         mixed_precision=args.mixed_precision,
@@ -688,8 +713,8 @@ def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_di
             model,
             external_dataset,
             optimizer,
-            toured_weight=2.0,
-            applied_weight=2.0,
+            toured_weight=3.0,  # Match the higher toured weight
+            applied_weight=1.0,
             rented_weight=2.0,
             epochs=5,
             device=device
@@ -737,12 +762,13 @@ def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_di
         }
     }
     
-    # NEW: Perform stage-specific analysis if enabled
+    # NEW: Perform stage-specific analysis and cluster evaluation
     if getattr(args, 'stage_analysis', False):
         try:
             # Get feature names for analysis
             feature_names = results.get('preprocessing', {}).get('feature_names', [])
             
+            print("\nPerforming stage-specific cluster analysis...")
             stage_analysis_results = perform_stage_specific_analysis(
                 model,
                 train_dataset,
@@ -752,11 +778,43 @@ def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_di
                 feature_names,
                 subset_label=subset_label
             )
+            
+            # Create a mapping from lead_ids to clusters for each stage
+            print("\nEvaluating cluster-specific performance metrics...")
+            cluster_mappings = {}
+            for stage in ['toured', 'applied', 'rented']:
+                if stage in stage_analysis_results:
+                    stage_data = stage_analysis_results[stage]
+                    # Map each lead ID to its cluster
+                    cluster_mappings[stage] = {
+                        lead_id: cluster 
+                        for lead_id, cluster in zip(stage_data['lead_ids'], stage_data['cluster_labels'])
+                    }
+                    
+                    # Evaluate metrics for each cluster
+                    if len(cluster_mappings[stage]) > 0:
+                        cluster_metrics = evaluate_cluster_specific_metrics(
+                            model, 
+                            test_loader,
+                            cluster_mappings[stage],
+                            device=device
+                        )
+                        # Store cluster-specific metrics
+                        stage_analysis_results[stage]['cluster_metrics'] = cluster_metrics
+            
             # Store the analysis results
             subset_results['stage_analysis'] = stage_analysis_results
+            
+            # Save stage analysis to a separate file for easier access
+            stage_analysis_path = os.path.join(args.output_dir, f'{subset_label}_stage_analysis.joblib')
+            joblib.dump(stage_analysis_results, stage_analysis_path)
+            print(f"Saved detailed stage analysis to {stage_analysis_path}")
+            
         except Exception as e:
             print(f"Warning: Stage analysis failed: {str(e)}")
-            print("Continuing without stage analysis...")
+            import traceback
+            traceback.print_exc()
+            print("Continuing without complete stage analysis...")
     
     # Store results in the results dictionary
     results[subset_label] = subset_results
@@ -766,6 +824,14 @@ def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_di
     print(f"  - Metrics: {metrics_csv_path}")
     print(f"  - Rankings: {rankings_csv_path}")
     print(f"  - Summary: {summary_csv_path}")
+    
+    # Print final metrics
+    print("\nFinal metrics summary:")
+    print("="*40)
+    print(f"Toured stage:  AUC={metrics['toured']['roc_auc']:.4f}  APR={metrics['toured']['apr']:.4f}")
+    print(f"Applied stage: AUC={metrics['applied']['roc_auc']:.4f}  APR={metrics['applied']['apr']:.4f}")
+    print(f"Rented stage:  AUC={metrics['rented']['roc_auc']:.4f}  APR={metrics['rented']['apr']:.4f}")
+    print("="*40)
 
     return model
 
@@ -825,6 +891,7 @@ def train_with_seed(args, seed=None):
     print(f"  - Toured k: {args.toured_k}")
     print(f"  - Applied k: {args.applied_k}")
     print(f"  - Rented k: {args.rented_k}")
+    print(f"  - Enhanced toured features: {args.enhance_toured_features}")
     print()
 
     # Preprocess data
@@ -844,6 +911,7 @@ def train_with_seed(args, seed=None):
         num_subsets=args.num_subsets,
         subset_size=args.subset_size,
         balance_classes=args.balance_classes,
+        enhance_toured_features=args.enhance_toured_features,  # Pass the new parameter
         random_state=args.seed
     )
 

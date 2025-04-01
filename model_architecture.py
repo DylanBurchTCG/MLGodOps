@@ -218,12 +218,43 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
         )
 
         # 4. Task-specific transformer blocks
-        self.transformer_toured = TabularTransformerBlock(transformer_dim, num_heads, ff_dim, dropout)
+        # ENHANCED: Deeper transformer path for toured stage (3 blocks instead of 1)
+        self.transformer_toured = nn.Sequential(
+            TabularTransformerBlock(transformer_dim, num_heads, ff_dim, dropout=dropout),
+            TabularTransformerBlock(transformer_dim, num_heads*2, ff_dim*2, dropout=dropout),  # Wider block
+            TabularTransformerBlock(transformer_dim, num_heads, ff_dim, dropout=dropout)
+        )
+        
+        # Add a special feature enhancement layer for toured prediction
+        self.toured_feature_enhancement = nn.Sequential(
+            nn.Linear(transformer_dim, transformer_dim*2),
+            nn.LayerNorm(transformer_dim*2),
+            nn.GELU(),
+            nn.Dropout(dropout + 0.1),  # Higher dropout for this path
+            nn.Linear(transformer_dim*2, transformer_dim)
+        )
+        
+        # Regular transformers for other stages
         self.transformer_applied = TabularTransformerBlock(transformer_dim, num_heads, ff_dim, dropout)
         self.transformer_rented = TabularTransformerBlock(transformer_dim, num_heads, ff_dim, dropout)
 
         # 5. Prediction heads for each stage
-        self.toured_head = PredictionHead(transformer_dim, head_hidden_dims, dropout)
+        # ENHANCED: Deeper prediction head for toured stage
+        toured_hidden_dims = [dim * 2 for dim in head_hidden_dims]  # Double the neurons
+        self.toured_head = nn.Sequential(
+            nn.Linear(transformer_dim, toured_hidden_dims[0]),
+            nn.BatchNorm1d(toured_hidden_dims[0]),
+            nn.ReLU(),
+            nn.Dropout(dropout + 0.1),  # Higher dropout
+            nn.Linear(toured_hidden_dims[0], toured_hidden_dims[0] // 2),
+            nn.BatchNorm1d(toured_hidden_dims[0] // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout + 0.05),
+            nn.Linear(toured_hidden_dims[0] // 2, 1),
+            nn.Sigmoid()
+        )
+        
+        # Regular prediction heads for other stages
         self.applied_head = PredictionHead(transformer_dim, head_hidden_dims, dropout)
         self.rented_head = PredictionHead(transformer_dim, head_hidden_dims, dropout)
         
@@ -259,8 +290,14 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
         # Shared representation
         shared_features = self.shared_transformer(x)
 
-        # Stage 1: Toured prediction
-        toured_features = self.transformer_toured(shared_features)
+        # Stage 1: Toured prediction with enhanced path
+        if isinstance(self.transformer_toured, nn.Sequential):
+            toured_features = self.transformer_toured(shared_features)
+        else:
+            toured_features = self.transformer_toured(shared_features)
+            
+        # Apply special feature enhancement for toured stage
+        toured_features = self.toured_feature_enhancement(toured_features)
         toured_pred = self.toured_head(toured_features)
 
         # Handle empty batches gracefully

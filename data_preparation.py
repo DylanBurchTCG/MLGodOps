@@ -25,7 +25,8 @@ def preprocess_data(
         preprocessors_path='./preprocessors',
         num_subsets=1,  # How many subsets to create (default=1 => no subsets, just entire data)
         subset_size=2000,  # Size of each subset (default 2k for initial selection)
-        balance_classes=False  # Whether to attempt balancing in each subset
+        balance_classes=False,  # Whether to attempt balancing in each subset
+        enhance_toured_features=True  # NEW: Add interaction features for toured stage
 ):
     """
     Preprocess the lead data for the neural network model.
@@ -113,6 +114,158 @@ def preprocess_data(
             matching_fields = data_dict[data_dict['LONG_DESCRIPTION'].str.contains(keyword, case=False, na=False)]
             important_cols.extend(matching_fields['FIELD_NAME'].tolist())
         print(f"* Identified {len(important_cols)} potentially important columns from data dictionary")
+    
+    # NEW: Enhanced feature engineering for toured prediction
+    if enhance_toured_features:
+        print("\n4.1 Creating specialized features for toured prediction...")
+        
+        # Try to identify date columns
+        date_columns = []
+        for col in data.columns:
+            # Simple heuristic - column name contains 'date' or 'time'
+            if 'date' in col.lower() or 'time' in col.lower() or 'day' in col.lower():
+                try:
+                    # Convert to datetime and keep track of columns that work
+                    pd.to_datetime(data[col], errors='coerce')
+                    date_columns.append(col)
+                except:
+                    pass
+        
+        print(f"* Identified {len(date_columns)} potential date/time columns")
+        
+        # Create time-based features if date columns exist
+        if date_columns:
+            # Find most promising date column (highest correlation with toured)
+            best_date_col = None
+            best_corr = 0
+            for col in date_columns:
+                try:
+                    # Convert to datetime
+                    data[f'{col}_dt'] = pd.to_datetime(data[col], errors='coerce')
+                    
+                    # Extract day of week
+                    data[f'{col}_dow'] = data[f'{col}_dt'].dt.dayofweek
+                    
+                    # Check correlation
+                    corr = abs(data[f'{col}_dow'].corr(y_toured, method='spearman'))
+                    if corr > best_corr:
+                        best_corr = corr
+                        best_date_col = col
+                except:
+                    # Skip if there are issues with this column
+                    continue
+                    
+            if best_date_col:
+                print(f"* Using '{best_date_col}' for time-based features (corr={best_corr:.4f})")
+                col = best_date_col
+                
+                # Create more time features from the best date column
+                try:
+                    data[f'{col}_month'] = data[f'{col}_dt'].dt.month
+                    data[f'{col}_day'] = data[f'{col}_dt'].dt.day
+                    data[f'{col}_hour'] = data[f'{col}_dt'].dt.hour
+                    data[f'{col}_weekend'] = (data[f'{col}_dow'] >= 5).astype(int)
+                    
+                    # Combine features - time of day categories
+                    data['time_category'] = 0  # default
+                    data.loc[data[f'{col}_hour'].between(0, 5), 'time_category'] = 1  # night
+                    data.loc[data[f'{col}_hour'].between(6, 11), 'time_category'] = 2  # morning
+                    data.loc[data[f'{col}_hour'].between(12, 17), 'time_category'] = 3  # afternoon
+                    data.loc[data[f'{col}_hour'].between(18, 23), 'time_category'] = 4  # evening
+                    
+                    print(f"* Created time-of-day categories: Night (1), Morning (2), Afternoon (3), Evening (4)")
+                except:
+                    print(f"* Could not create all time features for {col}")
+        
+        # Try to identify lead quality features
+        quality_keywords = ['income', 'credit', 'budget', 'qual', 'eligib', 'grade', 'tier', 'score']
+        quality_cols = []
+        
+        for kw in quality_keywords:
+            matching = [col for col in data.columns if kw in col.lower()]
+            quality_cols.extend(matching)
+        
+        print(f"* Identified {len(quality_cols)} potential lead quality indicators")
+        
+        # Create lead quality score - average of z-scores from quality columns
+        quality_features = []
+        for col in quality_cols:
+            try:
+                if pd.api.types.is_numeric_dtype(data[col]):
+                    # Standardize feature
+                    col_mean = data[col].mean()
+                    col_std = data[col].std()
+                    if col_std > 0:
+                        data[f'{col}_zscore'] = (data[col] - col_mean) / col_std
+                        quality_features.append(f'{col}_zscore')
+            except:
+                continue
+                
+        if quality_features:
+            try:
+                print(f"* Creating lead quality score from {len(quality_features)} features")
+                data['lead_quality_score'] = data[quality_features].mean(axis=1)
+                
+                # Fill missing values with median
+                data['lead_quality_score'] = data['lead_quality_score'].fillna(data['lead_quality_score'].median())
+            except:
+                print("* Could not create lead quality score")
+        
+        # Create location features if zip/location information is present
+        location_keywords = ['zip', 'state', 'city', 'postal', 'region', 'area', 'location', 'address']
+        location_cols = []
+        
+        for kw in location_keywords:
+            matching = [col for col in data.columns if kw.lower() in col.lower()]
+            location_cols.extend(matching)
+            
+        print(f"* Identified {len(location_cols)} potential location columns")
+        
+        # Create location clusters based on zip or region
+        location_cat_cols = []
+        for col in location_cols:
+            try:
+                if not pd.api.types.is_numeric_dtype(data[col]):
+                    unique_values = data[col].nunique()
+                    if 5 <= unique_values <= 1000:  # Reasonable number of categories
+                        location_cat_cols.append(col)
+            except:
+                continue
+                
+        if location_cat_cols:
+            # Use most granular location column (highest unique count)
+            best_loc_col = max(location_cat_cols, key=lambda x: data[x].nunique())
+            print(f"* Using '{best_loc_col}' for location features ({data[best_loc_col].nunique()} unique values)")
+            
+            # For zip/postal code, try to get first 3 digits (regional area)
+            if 'zip' in best_loc_col.lower() or 'postal' in best_loc_col.lower():
+                try:
+                    data[f'{best_loc_col}_region'] = data[best_loc_col].astype(str).str[:3]
+                    print(f"* Created region feature from {best_loc_col}")
+                except:
+                    pass
+        
+        # Create combined features (interactions)
+        # Try combinations of important features
+        try:
+            # Day of week x time of day
+            if 'time_category' in data.columns and f'{best_date_col}_dow' in data.columns:
+                data['day_time_interaction'] = data[f'{best_date_col}_dow'] * 10 + data['time_category']
+                print("* Created day_time_interaction feature")
+                
+            # Quality x Location
+            if 'lead_quality_score' in data.columns and f'{best_loc_col}_region' in data.columns:
+                # Group quality by region
+                region_avg_quality = data.groupby(f'{best_loc_col}_region')['lead_quality_score'].mean()
+                data['region_quality_diff'] = data.apply(
+                    lambda row: row['lead_quality_score'] - region_avg_quality.get(row[f'{best_loc_col}_region'], 0),
+                    axis=1
+                )
+                print("* Created region_quality_diff feature")
+        except:
+            print("* Could not create some interaction features")
+        
+        print(f"* Feature engineering complete - added {len(data.columns) - len(data.columns) - 10} new features")
 
     # Drop target columns from the feature set
     print("\n5. Feature Selection...")
@@ -326,6 +479,8 @@ def preprocess_data(
     if num_subsets <= 1:
         print("\n7. Train/Test Split...")
         print("-"*40)
+        if enhance_toured_features:
+            print("Enhanced feature engineering enabled for toured prediction")
         print("Cascade Flow: 2000 leads -> 1000 toured -> 500 applied -> 250 rented")
         torch.multiprocessing.set_sharing_strategy('file_system')
 
