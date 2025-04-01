@@ -809,3 +809,27 @@ def visualize_group_differences(differences, stage, save_path=None):
         print(f"Saved visualization to {save_path}")
     else:
         plt.show()
+
+def train_with_seed(args, seed=None):
+    # ... existing code ...
+    
+    # Print key configuration parameters
+    print(f"\nConfiguration:")
+    print(f"  - Data path: {args.data_path}")
+    print(f"  - Output directory: {args.output_dir}")
+    print(f"  - Output file: {args.output_file}")
+    print(f"  - Seed: {args.seed}")
+    print(f"  - Batch size: {args.batch_size}")
+    print(f"  - Gradient accumulation: {args.gradient_accum}")
+    
+    # Only show the selection method being used
+    if args.use_percentages:
+        print(f"  - Using percentage-based selection")
+        if args.adapt_to_data:
+            print(f"  - Adapting percentages to data distribution")
+        else:
+            print(f"  - Percentages: {args.toured_pct*100:.1f}% -> {args.applied_pct*100:.1f}% -> {args.rented_pct*100:.1f}%")
+    else:
+        print(f"  - Using fixed count selection: {args.toured_k} -> {args.applied_k} -> {args.rented_k}")
+        
+    print(f"  - Enhanced toured features: {args.enhance_toured_features}")
