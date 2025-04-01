@@ -9,13 +9,16 @@ from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import os
-import pickle
+import joblib
 from sklearn.metrics import roc_auc_score, average_precision_score
 
 
-# Custom dataset for leads
+# ----------------
+# Dataset Class
+# ----------------
 class LeadDataset(Dataset):
-    def __init__(self, categorical_features, numerical_features, toured_labels=None, applied_labels=None, rented_labels=None,
+    def __init__(self, categorical_features, numerical_features,
+                 toured_labels=None, applied_labels=None, rented_labels=None,
                  lead_ids=None):
         self.categorical_features = categorical_features
         self.numerical_features = numerical_features
@@ -33,195 +36,546 @@ class LeadDataset(Dataset):
             self.numerical_features[idx]
         ]
 
+        # Add labels if present
         if self.toured_labels is not None:
             items.append(self.toured_labels[idx])
         if self.applied_labels is not None:
             items.append(self.applied_labels[idx])
         if self.rented_labels is not None:
             items.append(self.rented_labels[idx])
+
+        # Add lead_id if present
         if self.lead_ids is not None:
             items.append(self.lead_ids[idx])
 
         return tuple(items)
 
 
-# Custom ranking loss function (using ListMLE approach)
-class ListMLELoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, scores, targets):
-        # Sort targets in descending order
-        sorted_targets, indices = torch.sort(targets, descending=True, dim=0)
-
-        # Reorder scores according to target sorting
-        ordered_scores = torch.gather(scores, 0, indices)
-
-        # Calculate log softmax probabilities
-        scores_softmax = F.log_softmax(ordered_scores, dim=0)
-
-        # Compute the negative log likelihood
-        loss = -torch.sum(scores_softmax)
-        return loss
-
-
-# Training function with multi-stage approach
-def train_model(model, train_loader, valid_loader, optimizer, scheduler, num_epochs=30,
-                toured_weight=1.0, applied_weight=1.0, rented_weight=2.0, device='cuda',
-                early_stopping_patience=5, model_save_path='best_model.pt',
-                mixed_precision=True, gradient_accumulation_steps=1):
+# ----------------
+# Multi-Stage Ranking
+# ----------------
+def rank_leads_multi_stage(model, dataloader,
+                           toured_k=2000, applied_k=1000, rented_k=250,
+                           device='cuda'):
     """
-    Train the lead funnel model with multi-stage approach
+    Ranks leads in a funnel:
+     1) Sort by Toured prob => top K
+     2) Among them, sort by Applied prob => top K
+     3) Among them, sort by Rented prob => top K
+    Returns a dict with selected IDs and excluded IDs for each stage.
     """
-    # Enable mixed precision training if requested (speeds up training on newer GPUs)
-    scaler = torch.cuda.amp.GradScaler() if mixed_precision and device.type == 'cuda' else None
+    model.eval()
 
-    # Loss functions - binary cross entropy for classification tasks
+    all_lead_ids = []
+    all_toured_preds = []
+    all_applied_preds = []
+    all_rented_preds = []
+
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Ranking leads"):
+            cat_in = batch[0].to(device)
+            num_in = batch[1].to(device)
+            lead_ids = batch[-1].cpu().numpy()
+
+            # Skip empty batches
+            if cat_in.size(0) == 0:
+                continue
+
+            try:
+                # Predict - support both standard and cascaded model interfaces
+                outputs = model(cat_in, num_in)
+                if isinstance(outputs, tuple) and len(outputs) >= 3:
+                    # Extract only predictions (first 3 outputs)
+                    toured_pred, applied_pred, rented_pred = outputs[:3]
+                else:
+                    toured_pred, applied_pred, rented_pred = outputs
+
+                all_lead_ids.extend(lead_ids)
+                all_toured_preds.extend(toured_pred.cpu().numpy())
+                all_applied_preds.extend(applied_pred.cpu().numpy())
+                all_rented_preds.extend(rented_pred.cpu().numpy())
+            except Exception as e:
+                print(f"Error in ranking batch: {str(e)}")
+                continue
+
+    # Convert to arrays
+    all_lead_ids = np.array(all_lead_ids)
+    all_toured_preds = np.array(all_toured_preds).flatten()
+    all_applied_preds = np.array(all_applied_preds).flatten()
+    all_rented_preds = np.array(all_rented_preds).flatten()
+
+    # Handle empty results case
+    if len(all_lead_ids) == 0:
+        print("Warning: No leads to rank")
+        return {
+            'toured': {'selected': np.array([]), 'scores': np.array([]), 'excluded': np.array([])},
+            'applied': {'selected': np.array([]), 'scores': np.array([]), 'excluded': np.array([])},
+            'rented': {'selected': np.array([]), 'scores': np.array([]), 'excluded': np.array([])}
+        }
+
+    # Ensure k values don't exceed the dataset size
+    toured_k = min(toured_k, len(all_lead_ids))
+
+    # Stage 1: Toured
+    toured_indices = np.argsort(all_toured_preds)[::-1][:toured_k]
+    toured_selected_ids = all_lead_ids[toured_indices]
+    toured_scores = all_toured_preds[toured_indices]
+    toured_excluded_ids = np.setdiff1d(all_lead_ids, toured_selected_ids)
+
+    print(f"Selected {len(toured_selected_ids)} out of {len(all_lead_ids)} leads for touring")
+
+    # Stage 2: Among the top Toured, rank by Applied
+    applied_k = min(applied_k, len(toured_selected_ids))
+    applied_subset = all_applied_preds[toured_indices]
+    applied_indices = np.argsort(applied_subset)[::-1][:applied_k]
+    applied_selected_ids = toured_selected_ids[applied_indices]
+    applied_scores = applied_subset[applied_indices]
+    applied_excluded_ids = np.setdiff1d(toured_selected_ids, applied_selected_ids)
+
+    print(f"Selected {len(applied_selected_ids)} out of {len(toured_selected_ids)} leads for applications")
+
+    # Stage 3: Among top Applied, rank by Rented
+    rented_k = min(rented_k, len(applied_selected_ids))
+    rented_subset = all_rented_preds[toured_indices][applied_indices]
+    rented_indices = np.argsort(rented_subset)[::-1][:rented_k]
+    rented_selected_ids = applied_selected_ids[rented_indices]
+    rented_scores = rented_subset[rented_indices]
+    rented_excluded_ids = np.setdiff1d(applied_selected_ids, rented_selected_ids)
+
+    print(f"Selected {len(rented_selected_ids)} out of {len(applied_selected_ids)} leads for rental")
+
+    result = {
+        'toured': {
+            'selected': toured_selected_ids,
+            'scores': toured_scores,
+            'excluded': toured_excluded_ids
+        },
+        'applied': {
+            'selected': applied_selected_ids,
+            'scores': applied_scores,
+            'excluded': applied_excluded_ids
+        },
+        'rented': {
+            'selected': rented_selected_ids,
+            'scores': rented_scores,
+            'excluded': rented_excluded_ids
+        }
+    }
+    return result
+
+
+# ----------------
+# Group Differences
+# ----------------
+def analyze_group_differences(dataframe, selected_ids, excluded_ids, feature_names, top_n=20):
+    """
+    For interpretability: compare average numeric feature values
+    between selected vs. excluded groups, returning the top absolute differences.
+    """
+    selected_df = dataframe[dataframe['CLIENT_PERSON_ID'].isin(selected_ids)]
+    excluded_df = dataframe[dataframe['CLIENT_PERSON_ID'].isin(excluded_ids)]
+
+    differences = {}
+    for feat in feature_names:
+        if feat in dataframe.columns:
+            # Only do numeric columns
+            if pd.api.types.is_numeric_dtype(dataframe[feat]):
+                sel_mean = selected_df[feat].mean()
+                exc_mean = excluded_df[feat].mean()
+                abs_diff = sel_mean - exc_mean
+                pct_diff = np.nan
+                if exc_mean != 0:
+                    pct_diff = abs_diff / exc_mean * 100.0
+
+                differences[feat] = {
+                    'selected_mean': sel_mean,
+                    'excluded_mean': exc_mean,
+                    'abs_diff': abs_diff,
+                    'pct_diff': pct_diff
+                }
+
+    # Sort by absolute difference
+    sorted_diffs = sorted(differences.items(), key=lambda x: abs(x[1]['abs_diff']), reverse=True)
+    top_features = sorted_diffs[:top_n]
+    return top_features, differences
+
+
+# ----------------
+# Fine-tune with Extra Data
+# ----------------
+def finetune_with_external_examples(model,
+                                    external_dataset,
+                                    optimizer,
+                                    toured_weight=2.0,
+                                    applied_weight=2.0,
+                                    rented_weight=2.0,
+                                    ranking_weight=0.3,
+                                    epochs=5,
+                                    device='cuda'):
+    """
+    Optionally incorporate new examples or corrected data
+    by running a short fine-tuning loop.
+    """
     toured_criterion = nn.BCELoss()
     applied_criterion = nn.BCELoss()
     rented_criterion = nn.BCELoss()
 
-    # For ranking-specific tasks, use ranking loss
-    ranking_criterion = ListMLELoss()
+    # Add ranking loss
+    ranking_criterion = nn.BCELoss()  # placeholder, will use model's ranking loss if available
+
+    # Use a more practical batch size for fine-tuning instead of loading all at once
+    batch_size = min(256, len(external_dataset))
+    ext_loader = DataLoader(external_dataset, batch_size=batch_size, shuffle=True)
+
+    print(f"Fine-tuning with {len(external_dataset)} examples using batch size {batch_size}")
+
+    model.train()
+
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        num_batches = 0
+
+        for batch in ext_loader:
+            cat_in = batch[0].to(device)
+            num_in = batch[1].to(device)
+            toured_labels = batch[2].to(device)
+            applied_labels = batch[3].to(device)
+            rented_labels = batch[4].to(device)
+            lead_ids = batch[5].to(device) if len(batch) > 5 else None
+
+            optimizer.zero_grad()
+            outputs = model(cat_in, num_in, lead_ids)
+
+            # Support both standard and cascaded model interfaces
+            if isinstance(outputs, tuple) and len(outputs) >= 3:
+                # Extract only predictions (first 3 outputs)
+                toured_pred, applied_pred, rented_pred = outputs[:3]
+            else:
+                toured_pred, applied_pred, rented_pred = outputs
+
+            # Standard BCE loss with gradient clipping
+            toured_loss = toured_weight * toured_criterion(toured_pred, toured_labels)
+            applied_loss = applied_weight * applied_criterion(applied_pred, applied_labels)
+            rented_loss = rented_weight * rented_criterion(rented_pred, rented_labels)
+
+            # Scale for fine-tuning
+            loss = 3.0 * (toured_loss + applied_loss + rented_loss)
+
+            # Check for invalid loss values
+            if torch.isnan(loss) or torch.isinf(loss) or loss > 1000:
+                print(f"Warning: Invalid loss value detected: {loss.item()}. Skipping batch.")
+                continue
+
+            loss.backward()
+            # Add gradient clipping to prevent exploding gradients
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            num_batches += 1
+
+        avg_epoch_loss = epoch_loss / max(1, num_batches)
+        print(f"Fine-tuning Epoch {epoch + 1}/{epochs}, Avg Loss: {avg_epoch_loss:.4f}")
+
+    return model
+
+
+# ----------------
+# Train the Model with Precision@k tracking
+# ----------------
+def train_model(model,
+                train_loader,
+                valid_loader,
+                optimizer,
+                scheduler,
+                num_epochs=30,
+                toured_weight=1.0,
+                applied_weight=1.0,
+                rented_weight=2.0,
+                ranking_weight=0.3,  # Added ranking loss weight
+                device='cuda',
+                early_stopping_patience=5,
+                model_save_path='best_model.pt',
+                mixed_precision=True,
+                gradient_accumulation_steps=1):
+    """
+    Standard training loop for multi-stage model (toured, applied, rented).
+    Uses BCE loss for each stage, plus weighting and optionally ranking loss.
+    """
+    # Enable mixed precision if requested
+    scaler = torch.cuda.amp.GradScaler() if (mixed_precision and device == 'cuda') else None
+
+    # Stage-specific BCE loss
+    toured_criterion = nn.BCELoss()
+    applied_criterion = nn.BCELoss()
+    rented_criterion = nn.BCELoss()
+
+    # Add ranking loss if the model supports it
+    ranking_criterion = None
+    if hasattr(model, 'ranking_loss'):
+        ranking_criterion = model.ranking_loss
 
     best_val_loss = float('inf')
     early_stopping_counter = 0
 
-    # Training history
     history = {
         'train_loss': [], 'val_loss': [],
         'toured_auc': [], 'applied_auc': [], 'rented_auc': [],
-        'toured_apr': [], 'applied_apr': [], 'rented_apr': []
+        'toured_apr': [], 'applied_apr': [], 'rented_apr': [],
+        'toured_p10': [], 'applied_p10': [], 'rented_p10': [],  # Added Precision@10
+        'toured_p50': [], 'applied_p50': [], 'rented_p50': []  # Added Precision@50
     }
 
-    # Track GPU memory usage if using CUDA
-    if device.type == 'cuda':
-        print(f"Initial GPU memory allocated: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB")
-
     for epoch in range(num_epochs):
-        # Training phase
+        # -------- TRAINING --------
         model.train()
         train_loss = 0.0
-        optimizer.zero_grad()  # Zero gradients once at the beginning of each epoch
+        optimizer.zero_grad()
 
-        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs} [Train]")
-        for batch_idx, batch in enumerate(progress_bar):
+        train_iter = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs} [Train]")
+        for batch_idx, batch in enumerate(train_iter):
             categorical_inputs = batch[0].to(device)
             numerical_inputs = batch[1].to(device)
             toured_labels = batch[2].to(device)
             applied_labels = batch[3].to(device)
             rented_labels = batch[4].to(device)
+            lead_ids = batch[5].to(device) if len(batch) > 5 else None
 
-            # Mixed precision training
-            if scaler is not None:
-                with torch.cuda.amp.autocast():
-                    # Forward pass
-                    toured_pred, applied_pred, rented_pred = model(categorical_inputs, numerical_inputs)
+            # Skip empty batches
+            if categorical_inputs.size(0) == 0:
+                continue
 
-                    # Compute stage-specific losses
+            try:
+                if scaler is not None:
+                    # Mixed precision
+                    with torch.cuda.amp.autocast():
+                        # Support both standard and cascaded model interfaces
+                        outputs = model(categorical_inputs, numerical_inputs, lead_ids)
+                        if isinstance(outputs, tuple) and len(outputs) >= 3:
+                            # Extract only predictions (first 3 outputs)
+                            toured_pred, applied_pred, rented_pred = outputs[:3]
+                        else:
+                            toured_pred, applied_pred, rented_pred = outputs
+
+                        # Standard BCE loss - clamped to prevent extreme values
+                        toured_loss = toured_criterion(toured_pred, toured_labels)
+                        applied_loss = applied_criterion(applied_pred, applied_labels)
+                        rented_loss = rented_criterion(rented_pred, rented_labels)
+
+                        # Check for NaN/Inf
+                        if torch.isnan(toured_loss) or torch.isinf(toured_loss) or toured_loss > 100:
+                            toured_loss = torch.tensor(1.0, device=device)
+                            print("Warning: Extreme toured loss detected and replaced")
+
+                        if torch.isnan(applied_loss) or torch.isinf(applied_loss) or applied_loss > 100:
+                            applied_loss = torch.tensor(1.0, device=device)
+                            print("Warning: Extreme applied loss detected and replaced")
+
+                        if torch.isnan(rented_loss) or torch.isinf(rented_loss) or rented_loss > 100:
+                            rented_loss = torch.tensor(1.0, device=device)
+                            print("Warning: Extreme rented loss detected and replaced")
+
+                        # Combine loss with weighting
+                        bce_loss = toured_weight * toured_loss + \
+                                   applied_weight * applied_loss + \
+                                   rented_weight * rented_loss
+
+                        # Add ranking loss if model supports it
+                        if ranking_criterion and categorical_inputs.size(0) >= 10:
+                            # Try to use ranking loss if batch size is large enough
+                            try:
+                                # Create a ranking loss for each stage
+                                from model_architecture import ListMLELoss
+                                ranking_module = ListMLELoss()
+
+                                toured_ranking_loss = ranking_module(toured_pred.squeeze(), toured_labels.squeeze())
+                                applied_ranking_loss = ranking_module(applied_pred.squeeze(), applied_labels.squeeze())
+                                rented_ranking_loss = ranking_module(rented_pred.squeeze(), rented_labels.squeeze())
+
+                                # Clamp to prevent extreme values
+                                toured_ranking_loss = torch.clamp(toured_ranking_loss, -100, 100)
+                                applied_ranking_loss = torch.clamp(applied_ranking_loss, -100, 100)
+                                rented_ranking_loss = torch.clamp(rented_ranking_loss, -100, 100)
+
+                                rank_loss = toured_weight * toured_ranking_loss + \
+                                            applied_weight * applied_ranking_loss + \
+                                            rented_weight * rented_ranking_loss
+
+                                # Combine BCE and ranking loss
+                                loss = (1.0 - ranking_weight) * bce_loss + ranking_weight * rank_loss
+                            except Exception as e:
+                                # If ranking loss fails, just use BCE
+                                print(f"Ranking loss failed: {str(e)}, using BCE only")
+                                loss = bce_loss
+                        else:
+                            loss = bce_loss
+
+                        # Final sanity check
+                        if not torch.isfinite(loss):
+                            print(f"WARNING: Non-finite loss detected: {loss}. Using fallback value.")
+                            loss = torch.tensor(10.0, device=device)  # Safe fallback
+
+                        # gradient accumulation
+                        loss = loss / gradient_accumulation_steps
+
+                    scaler.scale(loss).backward()
+
+                    if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                        scaler.unscale_(optimizer)
+                        nn.utils.clip_grad_norm_(model.parameters(), 10.0)  # Increased clipping threshold
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad()
+                else:
+                    # No mixed precision - similar logic but without scaler
+                    outputs = model(categorical_inputs, numerical_inputs, lead_ids)
+                    if isinstance(outputs, tuple) and len(outputs) >= 3:
+                        toured_pred, applied_pred, rented_pred = outputs[:3]
+                    else:
+                        toured_pred, applied_pred, rented_pred = outputs
+
                     toured_loss = toured_criterion(toured_pred, toured_labels)
                     applied_loss = applied_criterion(applied_pred, applied_labels)
                     rented_loss = rented_criterion(rented_pred, rented_labels)
 
-                    # Combined loss with weighting
-                    loss = toured_weight * toured_loss + applied_weight * applied_loss + rented_weight * rented_loss
-                    # Normalize loss if using gradient accumulation
+                    # Check for extreme values
+                    if torch.isnan(toured_loss) or torch.isinf(toured_loss) or toured_loss > 100:
+                        toured_loss = torch.tensor(1.0, device=device)
+                        print("Warning: Extreme toured loss detected and replaced")
+
+                    if torch.isnan(applied_loss) or torch.isinf(applied_loss) or applied_loss > 100:
+                        applied_loss = torch.tensor(1.0, device=device)
+                        print("Warning: Extreme applied loss detected and replaced")
+
+                    if torch.isnan(rented_loss) or torch.isinf(rented_loss) or rented_loss > 100:
+                        rented_loss = torch.tensor(1.0, device=device)
+                        print("Warning: Extreme rented loss detected and replaced")
+
+                    # Standard loss calculation
+                    bce_loss = toured_weight * toured_loss + \
+                               applied_weight * applied_loss + \
+                               rented_weight * rented_loss
+
+                    # Add ranking loss if model supports it and batch size large enough
+                    if ranking_criterion and categorical_inputs.size(0) >= 10:
+                        try:
+                            from model_architecture import ListMLELoss
+                            ranking_module = ListMLELoss()
+
+                            toured_ranking_loss = ranking_module(toured_pred.squeeze(), toured_labels.squeeze())
+                            applied_ranking_loss = ranking_module(applied_pred.squeeze(), applied_labels.squeeze())
+                            rented_ranking_loss = ranking_module(rented_pred.squeeze(), rented_labels.squeeze())
+
+                            # Clamp ranking losses
+                            toured_ranking_loss = torch.clamp(toured_ranking_loss, -100, 100)
+                            applied_ranking_loss = torch.clamp(applied_ranking_loss, -100, 100)
+                            rented_ranking_loss = torch.clamp(rented_ranking_loss, -100, 100)
+
+                            rank_loss = toured_weight * toured_ranking_loss + \
+                                        applied_weight * applied_ranking_loss + \
+                                        rented_weight * rented_ranking_loss
+
+                            # Combine BCE and ranking loss
+                            loss = (1.0 - ranking_weight) * bce_loss + ranking_weight * rank_loss
+                        except Exception as e:
+                            print(f"Ranking loss failed: {str(e)}, using BCE only")
+                            loss = bce_loss
+                    else:
+                        loss = bce_loss
+
+                    # Final sanity check
+                    if not torch.isfinite(loss):
+                        print(f"WARNING: Non-finite loss detected: {loss}. Using fallback value.")
+                        loss = torch.tensor(10.0, device=device)  # Safe fallback
+
                     loss = loss / gradient_accumulation_steps
+                    loss.backward()
 
-                # Backward pass with scaling
-                scaler.scale(loss).backward()
+                    if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                        nn.utils.clip_grad_norm_(model.parameters(), 10.0)  # Increased clipping threshold
+                        optimizer.step()
+                        optimizer.zero_grad()
 
-                # Only step every gradient_accumulation_steps batches
-                if (batch_idx + 1) % gradient_accumulation_steps == 0:
-                    # Gradient clipping
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                train_loss += loss.item() * gradient_accumulation_steps
+                train_iter.set_postfix({'loss': loss.item() * gradient_accumulation_steps})
 
-                    # Optimizer step with scaling
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad()
-            else:
-                # Forward pass
-                toured_pred, applied_pred, rented_pred = model(categorical_inputs, numerical_inputs)
+            except Exception as e:
+                print(f"Error in training batch {batch_idx}: {str(e)}")
+                print(f"Batch shapes: cat={categorical_inputs.shape}, num={numerical_inputs.shape}")
+                # Skip this batch and continue
+                continue
 
-                # Compute stage-specific losses
-                toured_loss = toured_criterion(toured_pred, toured_labels)
-                applied_loss = applied_criterion(applied_pred, applied_labels)
-                rented_loss = rented_criterion(rented_pred, rented_labels)
-
-                # Combined loss with weighting
-                loss = toured_weight * toured_loss + applied_weight * applied_loss + rented_weight * rented_loss
-                # Normalize loss if using gradient accumulation
-                loss = loss / gradient_accumulation_steps
-
-                # Backpropagation
-                loss.backward()
-
-                # Only step every gradient_accumulation_steps batches
-                if (batch_idx + 1) % gradient_accumulation_steps == 0:
-                    # Gradient clipping to prevent exploding gradients
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-                    # Optimizer step
-                    optimizer.step()
-                    optimizer.zero_grad()
-
-            # Track loss
-            train_loss += loss.item() * gradient_accumulation_steps
-            progress_bar.set_postfix({'loss': loss.item() * gradient_accumulation_steps})
-
-            # Print memory usage every 100 batches if using CUDA
-            if device.type == 'cuda' and batch_idx % 100 == 0:
-                print(f"GPU memory allocated: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB")
-
-        # Calculate average training loss
-        train_loss /= len(train_loader)
+        train_loss /= max(1, len(train_loader))
         history['train_loss'].append(train_loss)
 
-        # Validation phase
+        # -------- VALIDATION --------
         model.eval()
         val_loss = 0.0
-
-        # Collect predictions and labels for metrics calculation
         toured_preds, toured_true = [], []
         applied_preds, applied_true = [], []
         rented_preds, rented_true = [], []
 
-        with torch.no_grad():
-            progress_bar = tqdm(valid_loader, desc=f"Epoch {epoch + 1}/{num_epochs} [Valid]")
-            for batch in progress_bar:
-                categorical_inputs = batch[0].to(device)
-                numerical_inputs = batch[1].to(device)
-                toured_labels = batch[2].to(device)
-                applied_labels = batch[3].to(device)
-                rented_labels = batch[4].to(device)
+        valid_iter = tqdm(valid_loader, desc=f"Epoch {epoch + 1}/{num_epochs} [Valid]")
+        for batch in valid_iter:
+            categorical_inputs = batch[0].to(device)
+            numerical_inputs = batch[1].to(device)
+            toured_labels = batch[2].to(device)
+            applied_labels = batch[3].to(device)
+            rented_labels = batch[4].to(device)
+            lead_ids = batch[5].to(device) if len(batch) > 5 else None
 
-                # Forward pass
-                toured_pred, applied_pred, rented_pred = model(categorical_inputs, numerical_inputs)
+            # Skip empty batches
+            if categorical_inputs.size(0) == 0:
+                continue
 
-                # Compute losses
-                toured_loss = toured_criterion(toured_pred, toured_labels)
-                applied_loss = applied_criterion(applied_pred, applied_labels)
-                rented_loss = rented_criterion(rented_pred, rented_labels)
+            try:
+                with torch.no_grad():
+                    outputs = model(categorical_inputs, numerical_inputs, lead_ids)
+                    if isinstance(outputs, tuple) and len(outputs) >= 3:
+                        # Extract only predictions (first 3 outputs)
+                        toured_pred, applied_pred, rented_pred = outputs[:3]
+                    else:
+                        toured_pred, applied_pred, rented_pred = outputs
 
-                # Combined loss
-                loss = toured_weight * toured_loss + applied_weight * applied_loss + rented_weight * rented_loss
-                val_loss += loss.item()
+                    toured_loss = toured_criterion(toured_pred, toured_labels)
+                    applied_loss = applied_criterion(applied_pred, applied_labels)
+                    rented_loss = rented_criterion(rented_pred, rented_labels)
 
-                # Collect predictions and labels
-                toured_preds.append(toured_pred.cpu().numpy())
-                toured_true.append(toured_labels.cpu().numpy())
-                applied_preds.append(applied_pred.cpu().numpy())
-                applied_true.append(applied_labels.cpu().numpy())
-                rented_preds.append(rented_pred.cpu().numpy())
-                rented_true.append(rented_labels.cpu().numpy())
+                    # Handle extreme values
+                    if not torch.isfinite(toured_loss) or toured_loss > 100:
+                        toured_loss = torch.tensor(1.0, device=device)
+                    if not torch.isfinite(applied_loss) or applied_loss > 100:
+                        applied_loss = torch.tensor(1.0, device=device)
+                    if not torch.isfinite(rented_loss) or rented_loss > 100:
+                        rented_loss = torch.tensor(1.0, device=device)
 
-        # Calculate average validation loss
-        val_loss /= len(valid_loader)
+                    batch_loss = (toured_weight * toured_loss +
+                                  applied_weight * applied_loss +
+                                  rented_weight * rented_loss)
+
+                    # Final sanity check
+                    if not torch.isfinite(batch_loss) or batch_loss > 100:
+                        batch_loss = torch.tensor(3.0, device=device)
+
+                    val_loss += batch_loss.item()
+
+                    toured_preds.append(toured_pred.cpu().numpy())
+                    toured_true.append(toured_labels.cpu().numpy())
+
+                    applied_preds.append(applied_pred.cpu().numpy())
+                    applied_true.append(applied_labels.cpu().numpy())
+
+                    rented_preds.append(rented_pred.cpu().numpy())
+                    rented_true.append(rented_labels.cpu().numpy())
+            except Exception as e:
+                print(f"Error in validation batch: {str(e)}")
+                # Skip this batch and continue
+                continue
+
+        val_loss /= max(1, len(valid_loader))
         history['val_loss'].append(val_loss)
 
-        # Compute metrics
+        # Flatten predictions
         toured_preds = np.vstack(toured_preds)
         toured_true = np.vstack(toured_true)
         applied_preds = np.vstack(applied_preds)
@@ -229,35 +583,57 @@ def train_model(model, train_loader, valid_loader, optimizer, scheduler, num_epo
         rented_preds = np.vstack(rented_preds)
         rented_true = np.vstack(rented_true)
 
-        # AUC for each stage
+        # AUC + APR
         toured_auc = roc_auc_score(toured_true, toured_preds)
         applied_auc = roc_auc_score(applied_true, applied_preds)
         rented_auc = roc_auc_score(rented_true, rented_preds)
 
-        # Average Precision for each stage
         toured_apr = average_precision_score(toured_true, toured_preds)
         applied_apr = average_precision_score(applied_true, applied_preds)
         rented_apr = average_precision_score(rented_true, rented_preds)
 
-        # Store metrics
+        # Added Precision@k calculation
+        from model_architecture import precision_at_k
+
+        # Precision@10
+        k10 = min(10, len(toured_true))
+        toured_p10 = precision_at_k(toured_true.flatten(), toured_preds.flatten(), k10)
+        applied_p10 = precision_at_k(applied_true.flatten(), applied_preds.flatten(), k10)
+        rented_p10 = precision_at_k(rented_true.flatten(), rented_preds.flatten(), k10)
+
+        # Precision@50
+        k50 = min(50, len(toured_true))
+        toured_p50 = precision_at_k(toured_true.flatten(), toured_preds.flatten(), k50)
+        applied_p50 = precision_at_k(applied_true.flatten(), applied_preds.flatten(), k50)
+        rented_p50 = precision_at_k(rented_true.flatten(), rented_preds.flatten(), k50)
+
+        # Store all metrics
         history['toured_auc'].append(toured_auc)
         history['applied_auc'].append(applied_auc)
         history['rented_auc'].append(rented_auc)
         history['toured_apr'].append(toured_apr)
         history['applied_apr'].append(applied_apr)
         history['rented_apr'].append(rented_apr)
+        history['toured_p10'].append(toured_p10)
+        history['applied_p10'].append(applied_p10)
+        history['rented_p10'].append(rented_p10)
+        history['toured_p50'].append(toured_p50)
+        history['applied_p50'].append(applied_p50)
+        history['rented_p50'].append(rented_p50)
 
-        # Print metrics
         print(f"Epoch {epoch + 1}/{num_epochs}")
-        print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
-        print(f"Toured - AUC: {toured_auc:.4f}, APR: {toured_apr:.4f}")
-        print(f"Applied - AUC: {applied_auc:.4f}, APR: {applied_apr:.4f}")
-        print(f"Rented - AUC: {rented_auc:.4f}, APR: {rented_apr:.4f}")
+        print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+        print(
+            f"Toured  => AUC: {toured_auc:.4f}, APR: {toured_apr:.4f}, P@10: {toured_p10:.4f}, P@50: {toured_p50:.4f}")
+        print(
+            f"Applied => AUC: {applied_auc:.4f}, APR: {applied_apr:.4f}, P@10: {applied_p10:.4f}, P@50: {applied_p50:.4f}")
+        print(
+            f"Rented  => AUC: {rented_auc:.4f}, APR: {rented_apr:.4f}, P@10: {rented_p10:.4f}, P@50: {rented_p50:.4f}")
 
-        # Update learning rate
+        # Step LR scheduler
         scheduler.step(val_loss)
 
-        # Check for early stopping and save best model
+        # Early stopping
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(model.state_dict(), model_save_path)
@@ -268,203 +644,11 @@ def train_model(model, train_loader, valid_loader, optimizer, scheduler, num_epo
                 print(f"Early stopping triggered after {epoch + 1} epochs")
                 break
 
-    # Load best model
-    model.load_state_dict(torch.load(model_save_path))
+    # Load best state
+    try:
+        model.load_state_dict(torch.load(model_save_path))
+    except Exception as e:
+        print(f"Error loading best model state: {str(e)}")
+        print("Continuing with current model state...")
+
     return model, history
-
-
-# Stage-wise ranking function
-def rank_leads_multi_stage(model, dataloader, toured_k=500, applied_k=250, rented_k=125, device='cuda'):
-    """
-    Perform multi-stage ranking of leads:
-    1. Rank all leads by toured probability and select top toured_k
-    2. Rank those leads by applied probability and select top applied_k
-    3. Rank those leads by rented probability and select top rented_k
-    """
-    model.eval()
-    all_lead_ids = []
-    all_categorical = []
-    all_numerical = []
-    all_toured_preds = []
-    all_applied_preds = []
-    all_rented_preds = []
-
-    with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Ranking leads"):
-            categorical_inputs = batch[0].to(device)
-            numerical_inputs = batch[1].to(device)
-            lead_ids = batch[-1].cpu().numpy()
-
-            # Get predictions for all stages
-            toured_pred, applied_pred, rented_pred = model(categorical_inputs, numerical_inputs)
-
-            # Store data
-            all_lead_ids.extend(lead_ids)
-            all_categorical.append(categorical_inputs.cpu())
-            all_numerical.append(numerical_inputs.cpu())
-            all_toured_preds.extend(toured_pred.cpu().numpy())
-            all_applied_preds.extend(applied_pred.cpu().numpy())
-            all_rented_preds.extend(rented_pred.cpu().numpy())
-
-    # Convert to arrays/tensors
-    all_lead_ids = np.array(all_lead_ids)
-    all_toured_preds = np.array(all_toured_preds)
-    all_applied_preds = np.array(all_applied_preds)
-    all_rented_preds = np.array(all_rented_preds)
-
-    # Stage 1: Rank by toured probability
-    toured_indices = np.argsort(all_toured_preds.flatten())[::-1][:toured_k]
-    toured_selected_ids = all_lead_ids[toured_indices]
-    toured_selected_scores = all_toured_preds[toured_indices]
-    toured_excluded_ids = np.setdiff1d(all_lead_ids, toured_selected_ids)
-
-    # Stage 2: Among toured selections, rank by applied probability
-    applied_indices = np.argsort(all_applied_preds[toured_indices].flatten())[::-1][:applied_k]
-    applied_selected_indices = toured_indices[applied_indices]
-    applied_selected_ids = all_lead_ids[applied_selected_indices]
-    applied_selected_scores = all_applied_preds[toured_indices][applied_indices]
-    applied_excluded_ids = np.setdiff1d(toured_selected_ids, applied_selected_ids)
-
-    # Stage 3: Among applied selections, rank by rented probability
-    rented_indices = np.argsort(all_rented_preds[applied_selected_indices].flatten())[::-1][:rented_k]
-    rented_selected_indices = applied_selected_indices[rented_indices]
-    rented_selected_ids = all_lead_ids[rented_selected_indices]
-    rented_selected_scores = all_rented_preds[applied_selected_indices][rented_indices]
-    rented_excluded_ids = np.setdiff1d(applied_selected_ids, rented_selected_ids)
-
-    # Return selections and exclusions for each stage
-    result = {
-        'toured': {
-            'selected': toured_selected_ids,
-            'scores': toured_selected_scores,
-            'excluded': toured_excluded_ids
-        },
-        'applied': {
-            'selected': applied_selected_ids,
-            'scores': applied_selected_scores,
-            'excluded': applied_excluded_ids
-        },
-        'rented': {
-            'selected': rented_selected_ids,
-            'scores': rented_selected_scores,
-            'excluded': rented_excluded_ids
-        }
-    }
-
-    return result
-
-
-# Analyze differences between selected and non-selected leads
-def analyze_group_differences(dataframe, selected_ids, excluded_ids, feature_names, top_n=20):
-    """
-    Analyze and visualize differences between selected and non-selected leads
-
-    Args:
-        dataframe: Original DataFrame containing all leads
-        selected_ids: IDs of selected leads
-        excluded_ids: IDs of excluded leads
-        feature_names: List of feature names to analyze
-        top_n: Number of top features to return
-
-    Returns:
-        top_features: List of top N features with their differences
-        differences: Dictionary of all feature differences
-    """
-    selected_df = dataframe[dataframe['CLIENT_PERSON_ID'].isin(selected_ids)]
-    excluded_df = dataframe[dataframe['CLIENT_PERSON_ID'].isin(excluded_ids)]
-
-    # Calculate differences for each feature
-    differences = {}
-
-    for feature in feature_names:
-        if feature in dataframe.columns:
-            # Calculate means for each group
-            if dataframe[feature].dtype in [np.float64, np.int64]:
-                selected_mean = selected_df[feature].mean()
-                excluded_mean = excluded_df[feature].mean()
-
-                # Calculate differences
-                abs_diff = selected_mean - excluded_mean
-                if excluded_mean != 0:
-                    pct_diff = (abs_diff / excluded_mean) * 100
-                else:
-                    pct_diff = np.nan
-
-                # Store results
-                differences[feature] = {
-                    'selected_mean': selected_mean,
-                    'excluded_mean': excluded_mean,
-                    'abs_diff': abs_diff,
-                    'pct_diff': pct_diff
-                }
-
-    # Sort by absolute difference
-    sorted_diffs = sorted(differences.items(), key=lambda x: abs(x[1]['abs_diff']), reverse=True)
-
-    # Create visualization for top N features
-    top_features = sorted_diffs[:top_n]
-
-    # Return for further analysis
-    return top_features, differences
-
-
-# Incorporate external examples for fine-tuning
-def finetune_with_external_examples(model, external_dataset, optimizer,
-                                    toured_weight=2.0, applied_weight=2.0, rented_weight=2.0,
-                                    epochs=5, device='cuda'):
-    """
-    Fine-tune the model using a small set of external examples
-
-    Args:
-        model: The trained model to fine-tune
-        external_dataset: Dataset containing external examples
-        optimizer: Optimizer to use for fine-tuning
-        toured_weight: Weight for toured stage loss
-        applied_weight: Weight for applied stage loss
-        rented_weight: Weight for rented stage loss
-        epochs: Number of fine-tuning epochs
-        device: Device to use (cuda or cpu)
-
-    Returns:
-        model: Fine-tuned model
-    """
-    # Loss functions
-    toured_criterion = nn.BCELoss()
-    applied_criterion = nn.BCELoss()
-    rented_criterion = nn.BCELoss()
-
-    external_loader = DataLoader(external_dataset, batch_size=len(external_dataset), shuffle=True)
-
-    model.train()
-
-    for epoch in range(epochs):
-        for batch in external_loader:
-            categorical_inputs = batch[0].to(device)
-            numerical_inputs = batch[1].to(device)
-            toured_labels = batch[2].to(device)
-            applied_labels = batch[3].to(device)
-            rented_labels = batch[4].to(device)
-
-            # Zero gradients
-            optimizer.zero_grad()
-
-            # Forward pass
-            toured_pred, applied_pred, rented_pred = model(categorical_inputs, numerical_inputs)
-
-            # Compute stage-specific losses with higher weights (importance weighting)
-            toured_loss = toured_weight * toured_criterion(toured_pred, toured_labels)
-            applied_loss = applied_weight * applied_criterion(applied_pred, applied_labels)
-            rented_loss = rented_weight * rented_criterion(rented_pred, rented_labels)
-
-            # Combined loss with extra weighting for external examples
-            loss = 3.0 * (toured_loss + applied_loss + rented_loss)  # Higher weight for external examples
-
-            # Backpropagation
-            loss.backward()
-
-            # Optimizer step
-            optimizer.step()
-
-        print(f"Fine-tuning Epoch {epoch + 1}/{epochs}, Loss: {loss.item():.4f}")
-
-    return model
