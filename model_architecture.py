@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
+import csv
+import os
 
 
 class EmbeddingLayer(nn.Module):
@@ -135,19 +137,25 @@ class ListMLELoss(nn.Module):
         if targets.dim() > 1:
             targets = targets.squeeze()
 
+        # Add a small epsilon to prevent numerical issues
+        epsilon = 1e-10
+        
         # Sort targets in descending order
         sorted_targets, indices = torch.sort(targets, descending=True, dim=0)
 
         # Reorder scores according to target sorting
         ordered_scores = torch.gather(scores, 0, indices)
 
-        # Apply softmax to get probabilities
-        scores_softmax = F.log_softmax(ordered_scores, dim=0)
+        # Numerically stable implementation
+        # Apply log_softmax with temperature scaling to avoid extreme values
+        temperature = 0.1
+        scores_softmax = F.log_softmax(ordered_scores / temperature, dim=0)
+        
+        # Compute loss with clipping to prevent extreme values
+        loss = -torch.mean(torch.clamp(scores_softmax, min=-10, max=10))
 
-        # Compute loss
-        loss = -torch.sum(scores_softmax)
-
-        return loss
+        # Return a valid scalar loss value
+        return torch.clamp(loss, min=-5, max=5)
 
 
 class MultiTaskCascadedLeadFunnelModel(nn.Module):
@@ -176,6 +184,12 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
         self.toured_k = toured_k
         self.applied_k = applied_k
         self.rented_k = rented_k
+        
+        print(f"Initializing MultiTaskCascadedLeadFunnelModel with: ")
+        print(f"  - {len(categorical_dims)} categorical features")
+        print(f"  - {numerical_dim} numerical features")
+        print(f"  - Transformer dim: {transformer_dim}, heads: {num_heads}")
+        print(f"  - Selection flow: {toured_k} -> {applied_k} -> {rented_k}")
 
         # 1. Embedding layer
         self.embedding_layer = EmbeddingLayer(categorical_dims, embedding_dims, numerical_dim)
@@ -199,6 +213,22 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
         self.toured_head = PredictionHead(transformer_dim, head_hidden_dims, dropout)
         self.applied_head = PredictionHead(transformer_dim, head_hidden_dims, dropout)
         self.rented_head = PredictionHead(transformer_dim, head_hidden_dims, dropout)
+        
+        # Initialize weights
+        self._init_weights()
+        
+    def _init_weights(self):
+        """Careful weight initialization to prevent learning issues"""
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear):
+                # Xavier initialization for linear layers
+                nn.init.xavier_normal_(module.weight.data, gain=0.5)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias.data)
+            elif isinstance(module, nn.LayerNorm):
+                # Standard initialization for LayerNorm
+                nn.init.ones_(module.weight.data)
+                nn.init.zeros_(module.bias.data)
 
     def forward(self, categorical_inputs, numerical_inputs, lead_ids=None, is_training=True):
         """
@@ -238,7 +268,9 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
         if toured_pred.squeeze().dim() == 0:  # Handle scalar case
             toured_indices = torch.tensor([0], device=device)
         else:
-            _, toured_indices = torch.topk(toured_pred.squeeze(), k_toured)
+            # Apply slight noise to break ties randomly
+            noise = torch.randn_like(toured_pred.squeeze()) * 1e-6
+            _, toured_indices = torch.topk(toured_pred.squeeze() + noise, k_toured)
 
         if is_training:
             # During training, don't actually filter but track selection for loss weighting
@@ -258,7 +290,12 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
                     applied_indices_local = torch.tensor([0], device=device)
                 else:
                     k_applied = min(self.applied_k, len(toured_indices))
-                    _, applied_indices_local = torch.topk(applied_pred.squeeze()[toured_indices], k_applied)
+                    # Add noise to break ties randomly
+                    noise = torch.randn_like(applied_pred.squeeze()[toured_indices]) * 1e-6
+                    _, applied_indices_local = torch.topk(
+                        applied_pred.squeeze()[toured_indices] + noise, 
+                        k_applied
+                    )
                 applied_indices = toured_indices[applied_indices_local]
 
             # Process all leads for the rented stage
@@ -278,7 +315,12 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
                     rented_indices_local = torch.tensor([0], device=device)
                 else:
                     k_rented = min(self.rented_k, len(applied_indices))
-                    _, rented_indices_local = torch.topk(rented_pred.squeeze()[applied_indices], k_rented)
+                    # Add noise to break ties
+                    noise = torch.randn_like(rented_pred.squeeze()[applied_indices]) * 1e-6
+                    _, rented_indices_local = torch.topk(
+                        rented_pred.squeeze()[applied_indices] + noise, 
+                        k_rented
+                    )
                 rented_indices = applied_indices[rented_indices_local]
 
         else:
@@ -311,7 +353,12 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
                     applied_indices_local = torch.tensor([0], device=device)
                 else:
                     k_applied = min(self.applied_k, len(toured_indices))
-                    _, applied_indices_local = torch.topk(applied_pred_subset.squeeze(), k_applied)
+                    # Add noise to break ties
+                    noise = torch.randn_like(applied_pred_subset.squeeze()) * 1e-6
+                    _, applied_indices_local = torch.topk(
+                        applied_pred_subset.squeeze() + noise, 
+                        k_applied
+                    )
                 applied_indices = toured_indices[applied_indices_local]
 
             # Handle empty applied_indices
@@ -339,7 +386,12 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
                     rented_indices_local = torch.tensor([0], device=device)
                 else:
                     k_rented = min(self.rented_k, len(applied_indices))
-                    _, rented_indices_local = torch.topk(rented_pred_subset.squeeze(), k_rented)
+                    # Add noise to break ties
+                    noise = torch.randn_like(rented_pred_subset.squeeze()) * 1e-6
+                    _, rented_indices_local = torch.topk(
+                        rented_pred_subset.squeeze() + noise, 
+                        k_rented
+                    )
                 rented_indices = applied_indices[rented_indices_local]
 
         return toured_pred, applied_pred, rented_pred, toured_indices, applied_indices, rented_indices
@@ -387,10 +439,29 @@ def train_cascaded_model(model,
                          model_save_path='best_model.pt',
                          mixed_precision=True,
                          gradient_accumulation_steps=1,
-                         verbose=True):
+                         verbose=True,
+                         epoch_csv_path=None):  # New parameter to save per-epoch metrics to CSV
     """
     Training loop for cascaded model with ranking loss
     """
+    # Create CSV file for per-epoch metrics if requested
+    csv_file = None
+    csv_writer = None
+    if epoch_csv_path:
+        # Create directories if needed
+        os.makedirs(os.path.dirname(epoch_csv_path), exist_ok=True)
+        
+        # Open file and create writer
+        csv_file = open(epoch_csv_path, 'w', newline='')
+        fieldnames = [
+            'epoch', 'train_loss', 'val_loss', 'learning_rate',
+            'toured_auc', 'applied_auc', 'rented_auc',
+            'toured_apr', 'applied_apr', 'rented_apr',
+            'toured_p50', 'applied_p50', 'rented_p50'
+        ]
+        csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        csv_writer.writeheader()
+    
     # Enable mixed precision if requested
     scaler = torch.cuda.amp.GradScaler() if (mixed_precision and device == 'cuda') else None
 
@@ -405,12 +476,23 @@ def train_cascaded_model(model,
 
     best_val_loss = float('inf')
     early_stopping_counter = 0
-    history = {'train_loss': [], 'val_loss': []}
+    history = {'train_loss': [], 'val_loss': [], 'lr': []}
+
+    # Print training configuration
+    if verbose:
+        print(f"\nTraining cascade model for {num_epochs} epochs")
+        print(f"Device: {device}, Mixed precision: {mixed_precision}")
+        print(f"Batch size: {train_loader.batch_size}, Grad accumulation: {gradient_accumulation_steps}")
+        print(f"Loss weights: toured={toured_weight}, applied={applied_weight}, rented={rented_weight}")
+        print(f"Ranking loss weight: {ranking_weight}")
+        print(f"Early stopping patience: {early_stopping_patience}")
+        print("-" * 60)
 
     for epoch in range(num_epochs):
         # -------- TRAINING --------
         model.train()
         train_loss = 0.0
+        num_batches = 0
         optimizer.zero_grad()
 
         # Use tqdm only if verbose mode is on
@@ -439,16 +521,22 @@ def train_cascaded_model(model,
                             categorical_inputs, numerical_inputs, lead_ids, is_training=True
                         )
 
+                        # Add epsilon to prevent exact 0s and 1s
+                        epsilon = 1e-7
+                        toured_pred = torch.clamp(toured_pred, epsilon, 1 - epsilon)
+                        applied_pred = torch.clamp(applied_pred, epsilon, 1 - epsilon)
+                        rented_pred = torch.clamp(rented_pred, epsilon, 1 - epsilon)
+
                         # Calculate BCE losses with focus on selected indices
                         toured_losses = toured_criterion(toured_pred, toured_labels)
 
                         # Add loss clipping to prevent extremely large loss values
-                        toured_losses = torch.clamp(toured_losses, 0, 100)
+                        toured_losses = torch.clamp(toured_losses, 0, 10)
                         toured_loss = toured_losses.mean()
 
                         # For applied, weight higher for toured selected
                         applied_losses = applied_criterion(applied_pred, applied_labels)
-                        applied_losses = torch.clamp(applied_losses, 0, 100)
+                        applied_losses = torch.clamp(applied_losses, 0, 10)
 
                         toured_mask = torch.zeros_like(applied_losses, device=device)
                         if len(toured_idx) > 0:  # Only set weights if we have selected indices
@@ -460,7 +548,7 @@ def train_cascaded_model(model,
 
                         # For rented, weight higher for applied selected
                         rented_losses = rented_criterion(rented_pred, rented_labels)
-                        rented_losses = torch.clamp(rented_losses, 0, 100)
+                        rented_losses = torch.clamp(rented_losses, 0, 10)
 
                         applied_mask = torch.zeros_like(rented_losses, device=device)
                         if len(applied_idx) > 0:  # Only set weights if we have selected indices
@@ -484,9 +572,9 @@ def train_cascaded_model(model,
                                 rented_ranking_loss = ranking_criterion(rented_pred.squeeze(), rented_labels.squeeze())
 
                                 # Clamp ranking losses too
-                                toured_ranking_loss = torch.clamp(toured_ranking_loss, -100, 100)
-                                applied_ranking_loss = torch.clamp(applied_ranking_loss, -100, 100)
-                                rented_ranking_loss = torch.clamp(rented_ranking_loss, -100, 100)
+                                toured_ranking_loss = torch.clamp(toured_ranking_loss, -5, 5)
+                                applied_ranking_loss = torch.clamp(applied_ranking_loss, -5, 5)
+                                rented_ranking_loss = torch.clamp(rented_ranking_loss, -5, 5)
 
                                 ranking_loss = toured_weight * toured_ranking_loss + \
                                                applied_weight * applied_ranking_loss + \
@@ -496,16 +584,18 @@ def train_cascaded_model(model,
                                 loss = (1.0 - ranking_weight) * bce_loss + ranking_weight * ranking_loss
                             except Exception as e:
                                 # Fallback if ranking loss fails
-                                print(f"Ranking loss failed: {str(e)}, using BCE only")
+                                if verbose:
+                                    print(f"Ranking loss failed: {str(e)}, using BCE only")
                                 loss = bce_loss
                         else:
                             # Use only BCE if batch is too small
                             loss = bce_loss
 
                         # Final sanity check on loss value
-                        if not torch.isfinite(loss):
-                            print(f"WARNING: Non-finite loss detected: {loss}. Using fallback value.")
-                            loss = torch.tensor(10.0, device=device)  # Safe fallback
+                        if not torch.isfinite(loss) or loss > 10:
+                            if verbose:
+                                print(f"WARNING: Non-finite loss detected: {loss}. Using fallback value.")
+                            loss = torch.tensor(1.0, device=device)  # Safe fallback
 
                         # gradient accumulation
                         loss = loss / gradient_accumulation_steps
@@ -514,8 +604,8 @@ def train_cascaded_model(model,
 
                     if (batch_idx + 1) % gradient_accumulation_steps == 0:
                         scaler.unscale_(optimizer)
-                        # Increased gradient clipping threshold to prevent numerical issues
-                        nn.utils.clip_grad_norm_(model.parameters(), 10.0)
+                        # Reduced gradient clipping threshold for more stability
+                        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                         scaler.step(optimizer)
                         scaler.update()
                         optimizer.zero_grad()
@@ -525,13 +615,19 @@ def train_cascaded_model(model,
                         categorical_inputs, numerical_inputs, lead_ids, is_training=True
                     )
 
+                    # Add epsilon to prevent exact 0s and 1s
+                    epsilon = 1e-7
+                    toured_pred = torch.clamp(toured_pred, epsilon, 1 - epsilon)
+                    applied_pred = torch.clamp(applied_pred, epsilon, 1 - epsilon)
+                    rented_pred = torch.clamp(rented_pred, epsilon, 1 - epsilon)
+
                     # Calculate BCE losses
                     toured_losses = toured_criterion(toured_pred, toured_labels)
-                    toured_losses = torch.clamp(toured_losses, 0, 100)
+                    toured_losses = torch.clamp(toured_losses, 0, 10)
                     toured_loss = toured_losses.mean()
 
                     applied_losses = applied_criterion(applied_pred, applied_labels)
-                    applied_losses = torch.clamp(applied_losses, 0, 100)
+                    applied_losses = torch.clamp(applied_losses, 0, 10)
 
                     toured_mask = torch.zeros_like(applied_losses, device=device)
                     if len(toured_idx) > 0:
@@ -541,7 +637,7 @@ def train_cascaded_model(model,
                     applied_loss = (applied_losses * (toured_mask + 0.1)).mean()
 
                     rented_losses = rented_criterion(rented_pred, rented_labels)
-                    rented_losses = torch.clamp(rented_losses, 0, 100)
+                    rented_losses = torch.clamp(rented_losses, 0, 10)
 
                     applied_mask = torch.zeros_like(rented_losses, device=device)
                     if len(applied_idx) > 0:
@@ -563,9 +659,9 @@ def train_cascaded_model(model,
                             rented_ranking_loss = ranking_criterion(rented_pred.squeeze(), rented_labels.squeeze())
 
                             # Clamp ranking losses
-                            toured_ranking_loss = torch.clamp(toured_ranking_loss, -100, 100)
-                            applied_ranking_loss = torch.clamp(applied_ranking_loss, -100, 100)
-                            rented_ranking_loss = torch.clamp(rented_ranking_loss, -100, 100)
+                            toured_ranking_loss = torch.clamp(toured_ranking_loss, -5, 5)
+                            applied_ranking_loss = torch.clamp(applied_ranking_loss, -5, 5)
+                            rented_ranking_loss = torch.clamp(rented_ranking_loss, -5, 5)
 
                             ranking_loss = toured_weight * toured_ranking_loss + \
                                            applied_weight * applied_ranking_loss + \
@@ -574,42 +670,62 @@ def train_cascaded_model(model,
                             # Combine BCE and ranking loss
                             loss = (1.0 - ranking_weight) * bce_loss + ranking_weight * ranking_loss
                         except Exception as e:
-                            print(f"Ranking loss failed: {str(e)}, using BCE only")
+                            if verbose:
+                                print(f"Ranking loss failed: {str(e)}, using BCE only")
                             loss = bce_loss
                     else:
                         # Use only BCE if batch is too small
                         loss = bce_loss
 
                     # Final sanity check on loss value
-                    if not torch.isfinite(loss):
-                        print(f"WARNING: Non-finite loss detected: {loss}. Using fallback value.")
-                        loss = torch.tensor(10.0, device=device)  # Safe fallback
+                    if not torch.isfinite(loss) or loss > 10:
+                        if verbose:
+                            print(f"WARNING: Non-finite loss detected: {loss}. Using fallback value.")
+                        loss = torch.tensor(1.0, device=device)  # Safe fallback
 
                     loss = loss / gradient_accumulation_steps
                     loss.backward()
 
                     if (batch_idx + 1) % gradient_accumulation_steps == 0:
-                        nn.utils.clip_grad_norm_(model.parameters(), 10.0)
+                        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                         optimizer.step()
                         optimizer.zero_grad()
 
                 train_loss += loss.item() * gradient_accumulation_steps
+                
+                # Update progress bar with actual loss values
                 if verbose and hasattr(train_iter, 'set_postfix'):
-                    train_iter.set_postfix({'loss': loss.item() * gradient_accumulation_steps})
+                    train_iter.set_postfix({
+                        'loss': f"{loss.item() * gradient_accumulation_steps:.4f}",
+                        'toured': f"{toured_loss.item():.4f}",
+                        'applied': f"{applied_loss.item():.4f}",
+                        'rented': f"{rented_loss.item():.4f}"
+                    })
+                
+                num_batches += 1
 
             except Exception as e:
-                print(f"Error in training batch {batch_idx}: {str(e)}")
-                print(f"Batch shapes: cat={categorical_inputs.shape}, num={numerical_inputs.shape}")
+                if verbose:
+                    print(f"Error in training batch {batch_idx}: {str(e)}")
+                    print(f"Batch shapes: cat={categorical_inputs.shape}, num={numerical_inputs.shape}")
                 # Skip this batch and continue
                 continue
 
-        train_loss /= max(1, len(train_loader))
+        train_loss /= max(1, num_batches)
         history['train_loss'].append(train_loss)
+        current_lr = optimizer.param_groups[0]['lr']
+        history['lr'].append(current_lr)
 
         # -------- VALIDATION --------
         model.eval()
         val_loss = 0.0
         valid_batches = 0
+        all_toured_preds = []
+        all_toured_true = []
+        all_applied_preds = []
+        all_applied_true = []
+        all_rented_preds = []
+        all_rented_true = []
 
         # Use tqdm only if verbose mode is on
         if verbose:
@@ -636,6 +752,12 @@ def train_cascaded_model(model,
                         categorical_inputs, numerical_inputs, lead_ids, is_training=False
                     )
 
+                    # Add epsilon to predictions for numerical stability
+                    epsilon = 1e-7
+                    toured_pred = torch.clamp(toured_pred, epsilon, 1 - epsilon)
+                    applied_pred = torch.clamp(applied_pred, epsilon, 1 - epsilon)
+                    rented_pred = torch.clamp(rented_pred, epsilon, 1 - epsilon)
+
                     # Simple validation loss without weighting for simplicity
                     toured_loss = toured_criterion(toured_pred, toured_labels).mean()
                     applied_loss = applied_criterion(applied_pred, applied_labels).mean()
@@ -645,22 +767,117 @@ def train_cascaded_model(model,
                                   applied_weight * applied_loss +
                                   rented_weight * rented_loss)
 
-                    # Clamp validation loss too
-                    batch_loss = torch.clamp(batch_loss, 0, 100)
+                    # Clamp validation loss
+                    batch_loss = torch.clamp(batch_loss, 0, 10)
 
                     val_loss += batch_loss.item()
                     valid_batches += 1
+                    
+                    # Store predictions for metrics calculation
+                    all_toured_preds.append(toured_pred.cpu().numpy())
+                    all_toured_true.append(toured_labels.cpu().numpy())
+                    all_applied_preds.append(applied_pred.cpu().numpy())
+                    all_applied_true.append(applied_labels.cpu().numpy())
+                    all_rented_preds.append(rented_pred.cpu().numpy())
+                    all_rented_true.append(rented_labels.cpu().numpy())
+                    
             except Exception as e:
-                print(f"Error in validation batch: {str(e)}")
+                if verbose:
+                    print(f"Error in validation batch: {str(e)}")
                 # Skip this batch and continue
                 continue
 
         val_loss /= max(1, valid_batches)
         history['val_loss'].append(val_loss)
+        
+        # Calculate metrics
+        try:
+            # Combine predictions
+            all_toured_preds = np.vstack(all_toured_preds)
+            all_toured_true = np.vstack(all_toured_true)
+            all_applied_preds = np.vstack(all_applied_preds)
+            all_applied_true = np.vstack(all_applied_true)
+            all_rented_preds = np.vstack(all_rented_preds)
+            all_rented_true = np.vstack(all_rented_true)
+            
+            # AUC scores
+            from sklearn.metrics import roc_auc_score, average_precision_score
+            toured_auc = roc_auc_score(all_toured_true, all_toured_preds)
+            applied_auc = roc_auc_score(all_applied_true, all_applied_preds)
+            rented_auc = roc_auc_score(all_rented_true, all_rented_preds)
+            
+            # APR scores
+            toured_apr = average_precision_score(all_toured_true, all_toured_preds)
+            applied_apr = average_precision_score(all_applied_true, all_applied_preds)
+            rented_apr = average_precision_score(all_rented_true, all_rented_preds)
+            
+            # Precision@k
+            k = 50
+            toured_p50 = precision_at_k(all_toured_true.flatten(), all_toured_preds.flatten(), k)
+            applied_p50 = precision_at_k(all_applied_true.flatten(), all_applied_preds.flatten(), k)
+            rented_p50 = precision_at_k(all_rented_true.flatten(), all_rented_preds.flatten(), k)
+            
+            # Add metrics to history
+            if 'toured_auc' not in history:
+                history['toured_auc'] = []
+                history['applied_auc'] = []
+                history['rented_auc'] = []
+                history['toured_apr'] = []
+                history['applied_apr'] = []
+                history['rented_apr'] = []
+                history['toured_p50'] = []
+                history['applied_p50'] = []
+                history['rented_p50'] = []
+                
+            history['toured_auc'].append(toured_auc)
+            history['applied_auc'].append(applied_auc)
+            history['rented_auc'].append(rented_auc)
+            history['toured_apr'].append(toured_apr)
+            history['applied_apr'].append(applied_apr)
+            history['rented_apr'].append(rented_apr)
+            history['toured_p50'].append(toured_p50)
+            history['applied_p50'].append(applied_p50)
+            history['rented_p50'].append(rented_p50)
+            
+            has_metrics = True
+            
+            # Write to CSV if requested
+            if csv_writer:
+                csv_writer.writerow({
+                    'epoch': epoch + 1,
+                    'train_loss': train_loss,
+                    'val_loss': val_loss,
+                    'learning_rate': current_lr,
+                    'toured_auc': toured_auc,
+                    'applied_auc': applied_auc,
+                    'rented_auc': rented_auc,
+                    'toured_apr': toured_apr,
+                    'applied_apr': applied_apr,
+                    'rented_apr': rented_apr,
+                    'toured_p50': toured_p50,
+                    'applied_p50': applied_p50,
+                    'rented_p50': rented_p50
+                })
+                # Flush to ensure data is written immediately
+                csv_file.flush()
+                
+        except Exception as e:
+            if verbose:
+                print(f"Error calculating metrics: {str(e)}")
+            has_metrics = False
 
         # Print progress
-        if verbose or epoch % 5 == 0 or epoch == num_epochs - 1:
-            print(f"Epoch {epoch + 1}/{num_epochs} | Train loss: {train_loss:.4f} | Val loss: {val_loss:.4f}")
+        if verbose:
+            print(f"\nEpoch {epoch + 1}/{num_epochs}")
+            print("-" * 60)
+            print(f"Train loss: {train_loss:.4f} | Val loss: {val_loss:.4f} | LR: {current_lr:.6f}")
+            
+            if has_metrics:
+                print(f"\nMetrics:")
+                print(f"  Toured:  AUC={toured_auc:.4f}  APR={toured_apr:.4f}  P@50={toured_p50:.4f}")
+                print(f"  Applied: AUC={applied_auc:.4f}  APR={applied_apr:.4f}  P@50={applied_p50:.4f}")
+                print(f"  Rented:  AUC={rented_auc:.4f}  APR={rented_apr:.4f}  P@50={rented_p50:.4f}")
+            print("-" * 60)
 
         # Step LR scheduler
         scheduler.step(val_loss)
@@ -670,18 +887,30 @@ def train_cascaded_model(model,
             best_val_loss = val_loss
             torch.save(model.state_dict(), model_save_path)
             early_stopping_counter = 0
+            if verbose:
+                print(f"Model improved! Saved checkpoint at epoch {epoch + 1}")
         else:
             early_stopping_counter += 1
             if early_stopping_counter >= early_stopping_patience:
-                print(f"Early stopping after {epoch + 1} epochs")
+                if verbose:
+                    print(f"Early stopping after {epoch + 1} epochs")
                 break
+
+    # Close CSV file if it's open
+    if csv_file:
+        csv_file.close()
+        if verbose:
+            print(f"Per-epoch metrics saved to {epoch_csv_path}")
 
     # Load best state
     try:
         model.load_state_dict(torch.load(model_save_path))
+        if verbose:
+            print(f"Loaded best model state from {model_save_path}")
     except Exception as e:
-        print(f"Error loading best model state: {str(e)}")
-        print("Continuing with current model state...")
+        if verbose:
+            print(f"Error loading best model state: {str(e)}")
+            print("Continuing with current model state...")
 
     return model, history
 

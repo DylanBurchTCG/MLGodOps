@@ -9,6 +9,7 @@ from sklearn.metrics import roc_curve, precision_recall_curve, auc, roc_auc_scor
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import joblib
 import time
+import csv
 
 # Import our modules
 from model_architecture import MultiTaskCascadedLeadFunnelModel, train_cascaded_model, cascade_rank_leads, \
@@ -295,6 +296,149 @@ def finetune_cascaded_with_external_examples(model,
     return model
 
 
+def save_history_to_csv(history, csv_path):
+    """Save training history to a CSV file"""
+    with open(csv_path, 'w', newline='') as csvfile:
+        # Create CSV headers
+        fieldnames = ['epoch', 'train_loss', 'val_loss', 
+                      'toured_auc', 'applied_auc', 'rented_auc',
+                      'toured_apr', 'applied_apr', 'rented_apr',
+                      'toured_p10', 'applied_p10', 'rented_p10',
+                      'toured_p50', 'applied_p50', 'rented_p50',
+                      'learning_rate']
+        
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        
+        # Write each epoch's metrics
+        num_epochs = len(history['train_loss'])
+        for epoch in range(num_epochs):
+            row = {
+                'epoch': epoch + 1,
+                'train_loss': history['train_loss'][epoch],
+                'val_loss': history['val_loss'][epoch],
+                'learning_rate': history['lr'][epoch] if 'lr' in history else 'N/A'
+            }
+            
+            # Add metrics if they exist in history
+            for metric in ['auc', 'apr', 'p10', 'p50']:
+                for stage in ['toured', 'applied', 'rented']:
+                    key = f'{stage}_{metric}'
+                    row[key] = history[key][epoch] if key in history and epoch < len(history[key]) else 'N/A'
+            
+            writer.writerow(row)
+    
+    print(f"Training history saved to {csv_path}")
+
+
+def save_metrics_to_csv(metrics, csv_path):
+    """Save final metrics to a CSV file"""
+    with open(csv_path, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        
+        # Write headers
+        writer.writerow(['Stage', 'Metric', 'Value'])
+        
+        # Write metrics for each stage
+        for stage in ['toured', 'applied', 'rented']:
+            writer.writerow([stage, 'ROC-AUC', metrics[stage]['roc_auc']])
+            writer.writerow([stage, 'APR', metrics[stage]['apr']])
+            
+            # Write Precision@k values
+            for k, value in metrics[stage]['precision_at_k'].items():
+                writer.writerow([stage, f'Precision@{k}', value])
+    
+    print(f"Final metrics saved to {csv_path}")
+
+
+def save_rankings_to_csv(rankings, csv_path):
+    """Save ranking results to a CSV file"""
+    with open(csv_path, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        
+        # Write headers
+        writer.writerow(['Stage', 'Selected Count', 'Total Count', 'Selection Rate', 'Avg Score'])
+        
+        # Calculate and write metrics for each stage
+        stages = ['toured', 'applied', 'rented']
+        
+        # First calculate the total leads
+        total_leads = len(rankings['toured']['selected']) + len(rankings['toured']['excluded'])
+        
+        for stage in stages:
+            selected_count = len(rankings[stage]['selected'])
+            
+            # For toured, use the total. For others, use the previous stage selected count
+            if stage == 'toured':
+                base_count = total_leads
+            elif stage == 'applied':
+                base_count = len(rankings['toured']['selected'])
+            else:  # rented
+                base_count = len(rankings['applied']['selected'])
+                
+            selection_rate = (selected_count / base_count * 100) if base_count > 0 else 0
+            avg_score = np.mean(rankings[stage]['scores']) if len(rankings[stage]['scores']) > 0 else 0
+            
+            writer.writerow([
+                stage, 
+                selected_count, 
+                base_count, 
+                f"{selection_rate:.2f}%", 
+                f"{avg_score:.4f}"
+            ])
+    
+    print(f"Ranking results saved to {csv_path}")
+
+
+def save_consolidated_results(results, train_dataset, test_dataset, metrics, rankings, csv_path):
+    """Save a consolidated summary of results to a CSV file"""
+    with open(csv_path, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        
+        # Write general information
+        writer.writerow(['Training Summary'])
+        writer.writerow(['Train Dataset Size', len(train_dataset)])
+        writer.writerow(['Test Dataset Size', len(test_dataset)])
+        writer.writerow(['Timestamp', time.strftime('%Y-%m-%d %H:%M:%S')])
+        writer.writerow([])
+        
+        # Write stage metrics
+        writer.writerow(['Stage Metrics'])
+        writer.writerow(['Stage', 'ROC-AUC', 'APR', 'P@10', 'P@50', 'Selected', 'Selection Rate'])
+        
+        total_leads = len(rankings['toured']['selected']) + len(rankings['toured']['excluded'])
+        
+        for stage in ['toured', 'applied', 'rented']:
+            # For toured, use the total. For others, use the previous stage selected count
+            if stage == 'toured':
+                base_count = total_leads
+            elif stage == 'applied':
+                base_count = len(rankings['toured']['selected'])
+            else:  # rented
+                base_count = len(rankings['applied']['selected'])
+                
+            selected_count = len(rankings[stage]['selected'])
+            selection_rate = (selected_count / base_count * 100) if base_count > 0 else 0
+            
+            writer.writerow([
+                stage.capitalize(),
+                f"{metrics[stage]['roc_auc']:.4f}",
+                f"{metrics[stage]['apr']:.4f}",
+                f"{metrics[stage]['precision_at_k'][10] if 10 in metrics[stage]['precision_at_k'] else 'N/A'}",
+                f"{metrics[stage]['precision_at_k'][50] if 50 in metrics[stage]['precision_at_k'] else 'N/A'}",
+                selected_count,
+                f"{selection_rate:.2f}%"
+            ])
+        
+        # Add final conversion rate
+        initial_leads = total_leads
+        final_selected = len(rankings['rented']['selected'])
+        total_conversion = (final_selected / initial_leads * 100) if initial_leads > 0 else 0
+        writer.writerow(['Overall Conversion', f"{total_conversion:.2f}%"])
+        
+    print(f"Consolidated results saved to {csv_path}")
+
+
 def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_dims, numerical_dim, results,
                        subset_label="single"):
     """Train and evaluate a model for a single subset, storing results in the results dictionary"""
@@ -317,6 +461,16 @@ def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_di
     if transformer_dim % num_heads != 0:
         transformer_dim = (transformer_dim // num_heads) * num_heads
 
+    print("\n" + "="*80)
+    print(f"TRAINING MODEL FOR {subset_label}")
+    print("="*80)
+    print(f"Dataset: {len(train_dataset)} training samples, {len(test_dataset)} testing samples")
+    print(f"Features: {len(categorical_dims)} categorical, {numerical_dim} numerical")
+    print(f"Using device: {device}, Mixed precision: {args.mixed_precision}")
+    print(f"Training config: batch_size={effective_batch_size}, grad_accum={args.gradient_accum}")
+    print(f"Selection flow: {args.toured_k} -> {args.applied_k} -> {args.rented_k}")
+    print("="*80 + "\n")
+    
     # Initialize the multi-task cascaded model instead of regular cascaded model
     model = MultiTaskCascadedLeadFunnelModel(
         categorical_dims=categorical_dims,
@@ -332,19 +486,37 @@ def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_di
         rented_k=args.rented_k
     ).to(device)
 
+    # Print model size
+    model_size = sum(p.numel() for p in model.parameters())
+    print(f"Model initialized with {model_size:,} parameters")
+
     if args.debug:
         model = enable_debug_mode(model)
 
+    # Use a lower learning rate and clip gradients more aggressively
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
 
     # Temporarily create model file for train_cascaded_model
     # We'll delete this file later after loading its contents
     temp_model_path = os.path.join(args.output_dir, f'temp_model_{subset_label}.pt')
 
-    print(
-        f"Training model with {len(train_dataset)} samples, toured_k={args.toured_k}, applied_k={args.applied_k}, rented_k={args.rented_k}")
-    print(f"Using gradient accumulation steps: {args.gradient_accum}")
+    # Prepare CSV file paths
+    history_csv_path = os.path.join(args.output_dir, f'{subset_label}_history.csv')
+    metrics_csv_path = os.path.join(args.output_dir, f'{subset_label}_metrics.csv')
+    rankings_csv_path = os.path.join(args.output_dir, f'{subset_label}_rankings.csv')
+    summary_csv_path = os.path.join(args.output_dir, f'{subset_label}_summary.csv')
+    epoch_csv_path = os.path.join(args.output_dir, f'{subset_label}_epochs.csv')
+
+    print(f"Starting training with {len(train_dataset)} samples...")
+    print(f"Training configuration:")
+    print(f"  - Learning rate: {args.lr}")
+    print(f"  - Epochs: {args.epochs}")
+    print(f"  - Batch size: {effective_batch_size}")
+    print(f"  - Gradient accumulation: {args.gradient_accum}")
+    print(f"  - Mixed precision: {args.mixed_precision}")
+    print(f"  - Selection stages: {args.toured_k} -> {args.applied_k} -> {args.rented_k}")
+    print(f"  - CSV output will be saved to {args.output_dir}\n")
 
     # Use the cascaded training function with ranking loss
     model, history = train_cascaded_model(
@@ -362,8 +534,12 @@ def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_di
         model_save_path=temp_model_path,
         mixed_precision=args.mixed_precision,
         gradient_accumulation_steps=args.gradient_accum,
-        verbose=True  # Enable verbose output
+        verbose=True,  # Always enable verbose output
+        epoch_csv_path=epoch_csv_path  # Add epoch-by-epoch CSV logging
     )
+
+    # Save training history to CSV
+    save_history_to_csv(history, history_csv_path)
 
     # Store the state dict bytes
     if os.path.exists(temp_model_path):
@@ -400,6 +576,7 @@ def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_di
         model_state_bytes = finetuned_state_buffer
 
     # Use the cascaded ranking function
+    print(f"\n{'-'*80}")
     print(f"[Subset {subset_label}] Performing multi-stage ranking on the test set...")
     rankings = cascade_rank_leads(
         model,
@@ -408,19 +585,41 @@ def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_di
         silent=False
     )
 
+    # Save rankings to CSV
+    save_rankings_to_csv(rankings, rankings_csv_path)
+
     # Calculate and store metrics, including Precision@k
+    print(f"\n{'-'*80}")
     print(f"[Subset {subset_label}] Calculating ROC-AUC, APR, and Precision@k metrics...")
     metrics = calculate_metrics(test_loader, model, device, k_values=[10, 20, 50, 100])
+
+    # Save metrics to CSV
+    save_metrics_to_csv(metrics, metrics_csv_path)
+
+    # Create a consolidated summary CSV
+    save_consolidated_results(results, train_dataset, test_dataset, metrics, rankings, summary_csv_path)
 
     # Store results in the results dictionary
     subset_results = {
         'history': history,
         'model_state_bytes': model_state_bytes,
         'rankings': rankings,
-        'metrics': metrics
+        'metrics': metrics,
+        'csv_files': {
+            'history': history_csv_path,
+            'metrics': metrics_csv_path,
+            'rankings': rankings_csv_path,
+            'summary': summary_csv_path
+        }
     }
 
     results[subset_label] = subset_results
+
+    print(f"\nResult CSV files created:")
+    print(f"  - Training history: {history_csv_path}")
+    print(f"  - Metrics: {metrics_csv_path}")
+    print(f"  - Rankings: {rankings_csv_path}")
+    print(f"  - Summary: {summary_csv_path}")
 
     return model
 
@@ -430,6 +629,11 @@ def train_with_seed(args, seed=None):
 
     if seed is not None:
         args.seed = seed
+
+    # Print header for this training run
+    print("\n" + "="*80)
+    print(f"STARTING TRAINING RUN WITH SEED {args.seed}")
+    print("="*80 + "\n")
 
     # Seed everything
     torch.manual_seed(args.seed)
@@ -464,9 +668,26 @@ def train_with_seed(args, seed=None):
         }
     }
 
+    # Print key configuration parameters
+    print(f"\nConfiguration:")
+    print(f"  - Data path: {args.data_path}")
+    print(f"  - Output directory: {args.output_dir}")
+    print(f"  - Output file: {args.output_file}")
+    print(f"  - Seed: {args.seed}")
+    print(f"  - Batch size: {args.batch_size}")
+    print(f"  - Gradient accumulation: {args.gradient_accum}")
+    print(f"  - Toured k: {args.toured_k}")
+    print(f"  - Applied k: {args.applied_k}")
+    print(f"  - Rented k: {args.rented_k}")
+    print()
+
     # Preprocess data
     # This call can return either a single (train_ds, test_ds, cat_dims, num_dim, feat_names)
     # or a dict with multiple subsets if num_subsets>1
+    print("\n" + "="*80)
+    print("DATA PREPARATION")
+    print("="*80 + "\n")
+    
     preprocess_result = preprocess_data(
         data_path=args.data_path,
         dict_path=args.dict_path,
@@ -542,6 +763,50 @@ def train_with_seed(args, seed=None):
     return results
 
 
+def create_seed_summary(all_seeds_results, output_path):
+    """Create a summary CSV file with the key metrics from all seed runs"""
+    with open(output_path, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        
+        # Write header
+        writer.writerow(['Seed', 'Stage', 'ROC-AUC', 'APR', 'P@50', 'Final Train Loss', 'Final Val Loss'])
+        
+        # Write data for each seed
+        for seed_key, seed_results in all_seeds_results.items():
+            seed = seed_key.replace('seed_', '')
+            
+            # Find the subset results (single or subset1 if multiple)
+            subset_key = 'single' if 'single' in seed_results else 'subset1'
+            if subset_key in seed_results:
+                subset_results = seed_results[subset_key]
+                metrics = subset_results['metrics']
+                history = subset_results['history']
+                
+                # Get final loss values
+                final_train_loss = history['train_loss'][-1] if 'train_loss' in history and history['train_loss'] else 'N/A'
+                final_val_loss = history['val_loss'][-1] if 'val_loss' in history and history['val_loss'] else 'N/A'
+                
+                # Add rows for each stage
+                for stage in ['toured', 'applied', 'rented']:
+                    if stage in metrics:
+                        stage_metrics = metrics[stage]
+                        auc = stage_metrics['roc_auc']
+                        apr = stage_metrics['apr']
+                        p50 = stage_metrics['precision_at_k'].get(50, 'N/A')
+                        
+                        writer.writerow([
+                            seed,
+                            stage,
+                            f"{auc:.4f}",
+                            f"{apr:.4f}",
+                            f"{p50:.4f}" if p50 != 'N/A' else 'N/A',
+                            f"{final_train_loss:.4f}" if final_train_loss != 'N/A' else 'N/A',
+                            f"{final_val_loss:.4f}" if final_val_loss != 'N/A' else 'N/A'
+                        ])
+    
+    print(f"Summary of all seed runs saved to {output_path}")
+
+
 def main():
     global args, device, categorical_dims, numerical_dim
     args = parse_args()
@@ -577,6 +842,10 @@ def main():
         consolidated_path = os.path.join(args.output_dir, f"consolidated_{args.output_file}")
         joblib.dump(all_seeds_results, consolidated_path)
         print(f"Consolidated results from all seeds saved to {consolidated_path}")
+        
+        # Create a summary CSV report
+        seed_summary_path = os.path.join(args.output_dir, "seed_summary.csv")
+        create_seed_summary(all_seeds_results, seed_summary_path)
     else:
         # Single seed run
         train_with_seed(args)

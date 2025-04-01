@@ -306,9 +306,9 @@ def train_model(model,
     scaler = torch.cuda.amp.GradScaler() if (mixed_precision and device == 'cuda') else None
 
     # Stage-specific BCE loss
-    toured_criterion = nn.BCELoss()
-    applied_criterion = nn.BCELoss()
-    rented_criterion = nn.BCELoss()
+    toured_criterion = nn.BCELoss(reduction='mean')
+    applied_criterion = nn.BCELoss(reduction='mean')
+    rented_criterion = nn.BCELoss(reduction='mean')
 
     # Add ranking loss if the model supports it
     ranking_criterion = None
@@ -326,10 +326,15 @@ def train_model(model,
         'toured_p50': [], 'applied_p50': [], 'rented_p50': []  # Added Precision@50
     }
 
+    print(f"\nStarting training for {num_epochs} epochs with device={device}")
+    print(f"Mixed precision: {mixed_precision}, Grad accumulation: {gradient_accumulation_steps}")
+    print(f"Loss weights: toured={toured_weight}, applied={applied_weight}, rented={rented_weight}")
+    
     for epoch in range(num_epochs):
         # -------- TRAINING --------
         model.train()
         train_loss = 0.0
+        num_batches = 0
         optimizer.zero_grad()
 
         train_iter = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs} [Train]")
@@ -357,30 +362,37 @@ def train_model(model,
                         else:
                             toured_pred, applied_pred, rented_pred = outputs
 
+                        # Add epsilon to prevent exact 0s and 1s which can cause numerical instability
+                        epsilon = 1e-7
+                        toured_pred = torch.clamp(toured_pred, epsilon, 1 - epsilon)
+                        applied_pred = torch.clamp(applied_pred, epsilon, 1 - epsilon)
+                        rented_pred = torch.clamp(rented_pred, epsilon, 1 - epsilon)
+
                         # Standard BCE loss - clamped to prevent extreme values
                         toured_loss = toured_criterion(toured_pred, toured_labels)
                         applied_loss = applied_criterion(applied_pred, applied_labels)
                         rented_loss = rented_criterion(rented_pred, rented_labels)
 
-                        # Check for NaN/Inf
-                        if torch.isnan(toured_loss) or torch.isinf(toured_loss) or toured_loss > 100:
-                            toured_loss = torch.tensor(1.0, device=device)
-                            print("Warning: Extreme toured loss detected and replaced")
+                        # Check for NaN/Inf with strict replacement
+                        if torch.isnan(toured_loss) or torch.isinf(toured_loss) or toured_loss > 10:
+                            toured_loss = torch.tensor(0.5, device=device)
+                            print(f"Warning: Replaced extreme toured loss")
 
-                        if torch.isnan(applied_loss) or torch.isinf(applied_loss) or applied_loss > 100:
-                            applied_loss = torch.tensor(1.0, device=device)
-                            print("Warning: Extreme applied loss detected and replaced")
+                        if torch.isnan(applied_loss) or torch.isinf(applied_loss) or applied_loss > 10:
+                            applied_loss = torch.tensor(0.5, device=device)
+                            print(f"Warning: Replaced extreme applied loss")
 
-                        if torch.isnan(rented_loss) or torch.isinf(rented_loss) or rented_loss > 100:
-                            rented_loss = torch.tensor(1.0, device=device)
-                            print("Warning: Extreme rented loss detected and replaced")
+                        if torch.isnan(rented_loss) or torch.isinf(rented_loss) or rented_loss > 10:
+                            rented_loss = torch.tensor(0.5, device=device)
+                            print(f"Warning: Replaced extreme rented loss")
 
                         # Combine loss with weighting
                         bce_loss = toured_weight * toured_loss + \
                                    applied_weight * applied_loss + \
                                    rented_weight * rented_loss
 
-                        # Add ranking loss if model supports it
+                        # Add ranking loss if model supports it and if batch size is sufficient
+                        rank_loss = 0
                         if ranking_criterion and categorical_inputs.size(0) >= 10:
                             # Try to use ranking loss if batch size is large enough
                             try:
@@ -393,9 +405,9 @@ def train_model(model,
                                 rented_ranking_loss = ranking_module(rented_pred.squeeze(), rented_labels.squeeze())
 
                                 # Clamp to prevent extreme values
-                                toured_ranking_loss = torch.clamp(toured_ranking_loss, -100, 100)
-                                applied_ranking_loss = torch.clamp(applied_ranking_loss, -100, 100)
-                                rented_ranking_loss = torch.clamp(rented_ranking_loss, -100, 100)
+                                toured_ranking_loss = torch.clamp(toured_ranking_loss, -5, 5)
+                                applied_ranking_loss = torch.clamp(applied_ranking_loss, -5, 5)
+                                rented_ranking_loss = torch.clamp(rented_ranking_loss, -5, 5)
 
                                 rank_loss = toured_weight * toured_ranking_loss + \
                                             applied_weight * applied_ranking_loss + \
@@ -410,10 +422,10 @@ def train_model(model,
                         else:
                             loss = bce_loss
 
-                        # Final sanity check
-                        if not torch.isfinite(loss):
+                        # Final sanity check with strict limits
+                        if not torch.isfinite(loss) or loss > 10:
                             print(f"WARNING: Non-finite loss detected: {loss}. Using fallback value.")
-                            loss = torch.tensor(10.0, device=device)  # Safe fallback
+                            loss = torch.tensor(1.0, device=device)  # Safe fallback
 
                         # gradient accumulation
                         loss = loss / gradient_accumulation_steps
@@ -422,7 +434,7 @@ def train_model(model,
 
                     if (batch_idx + 1) % gradient_accumulation_steps == 0:
                         scaler.unscale_(optimizer)
-                        nn.utils.clip_grad_norm_(model.parameters(), 10.0)  # Increased clipping threshold
+                        nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Stricter gradient clipping
                         scaler.step(optimizer)
                         scaler.update()
                         optimizer.zero_grad()
@@ -434,22 +446,29 @@ def train_model(model,
                     else:
                         toured_pred, applied_pred, rented_pred = outputs
 
+                    # Add epsilon to prevent exact 0s and 1s
+                    epsilon = 1e-7
+                    toured_pred = torch.clamp(toured_pred, epsilon, 1 - epsilon)
+                    applied_pred = torch.clamp(applied_pred, epsilon, 1 - epsilon)
+                    rented_pred = torch.clamp(rented_pred, epsilon, 1 - epsilon)
+
+                    # Standard loss calculation
                     toured_loss = toured_criterion(toured_pred, toured_labels)
                     applied_loss = applied_criterion(applied_pred, applied_labels)
                     rented_loss = rented_criterion(rented_pred, rented_labels)
 
                     # Check for extreme values
-                    if torch.isnan(toured_loss) or torch.isinf(toured_loss) or toured_loss > 100:
-                        toured_loss = torch.tensor(1.0, device=device)
-                        print("Warning: Extreme toured loss detected and replaced")
+                    if torch.isnan(toured_loss) or torch.isinf(toured_loss) or toured_loss > 10:
+                        toured_loss = torch.tensor(0.5, device=device)
+                        print(f"Warning: Replaced extreme toured loss")
 
-                    if torch.isnan(applied_loss) or torch.isinf(applied_loss) or applied_loss > 100:
-                        applied_loss = torch.tensor(1.0, device=device)
-                        print("Warning: Extreme applied loss detected and replaced")
+                    if torch.isnan(applied_loss) or torch.isinf(applied_loss) or applied_loss > 10:
+                        applied_loss = torch.tensor(0.5, device=device)
+                        print(f"Warning: Replaced extreme applied loss")
 
-                    if torch.isnan(rented_loss) or torch.isinf(rented_loss) or rented_loss > 100:
-                        rented_loss = torch.tensor(1.0, device=device)
-                        print("Warning: Extreme rented loss detected and replaced")
+                    if torch.isnan(rented_loss) or torch.isinf(rented_loss) or rented_loss > 10:
+                        rented_loss = torch.tensor(0.5, device=device)
+                        print(f"Warning: Replaced extreme rented loss")
 
                     # Standard loss calculation
                     bce_loss = toured_weight * toured_loss + \
@@ -466,10 +485,10 @@ def train_model(model,
                             applied_ranking_loss = ranking_module(applied_pred.squeeze(), applied_labels.squeeze())
                             rented_ranking_loss = ranking_module(rented_pred.squeeze(), rented_labels.squeeze())
 
-                            # Clamp ranking losses
-                            toured_ranking_loss = torch.clamp(toured_ranking_loss, -100, 100)
-                            applied_ranking_loss = torch.clamp(applied_ranking_loss, -100, 100)
-                            rented_ranking_loss = torch.clamp(rented_ranking_loss, -100, 100)
+                            # Clamp ranking losses with stricter bounds
+                            toured_ranking_loss = torch.clamp(toured_ranking_loss, -5, 5)
+                            applied_ranking_loss = torch.clamp(applied_ranking_loss, -5, 5)
+                            rented_ranking_loss = torch.clamp(rented_ranking_loss, -5, 5)
 
                             rank_loss = toured_weight * toured_ranking_loss + \
                                         applied_weight * applied_ranking_loss + \
@@ -484,20 +503,21 @@ def train_model(model,
                         loss = bce_loss
 
                     # Final sanity check
-                    if not torch.isfinite(loss):
+                    if not torch.isfinite(loss) or loss > 10:
                         print(f"WARNING: Non-finite loss detected: {loss}. Using fallback value.")
-                        loss = torch.tensor(10.0, device=device)  # Safe fallback
+                        loss = torch.tensor(1.0, device=device)  # Safe fallback
 
                     loss = loss / gradient_accumulation_steps
                     loss.backward()
 
                     if (batch_idx + 1) % gradient_accumulation_steps == 0:
-                        nn.utils.clip_grad_norm_(model.parameters(), 10.0)  # Increased clipping threshold
+                        nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Stricter gradient clipping
                         optimizer.step()
                         optimizer.zero_grad()
 
                 train_loss += loss.item() * gradient_accumulation_steps
-                train_iter.set_postfix({'loss': loss.item() * gradient_accumulation_steps})
+                train_iter.set_postfix({'loss': float(loss.item() * gradient_accumulation_steps)})
+                num_batches += 1
 
             except Exception as e:
                 print(f"Error in training batch {batch_idx}: {str(e)}")
@@ -505,7 +525,7 @@ def train_model(model,
                 # Skip this batch and continue
                 continue
 
-        train_loss /= max(1, len(train_loader))
+        train_loss /= max(1, num_batches)
         history['train_loss'].append(train_loss)
 
         # -------- VALIDATION --------
@@ -541,20 +561,20 @@ def train_model(model,
                     applied_loss = applied_criterion(applied_pred, applied_labels)
                     rented_loss = rented_criterion(rented_pred, rented_labels)
 
-                    # Handle extreme values
-                    if not torch.isfinite(toured_loss) or toured_loss > 100:
+                    # Handle extreme values - stricter clipping to prevent huge loss values
+                    if not torch.isfinite(toured_loss) or toured_loss > 50:
                         toured_loss = torch.tensor(1.0, device=device)
-                    if not torch.isfinite(applied_loss) or applied_loss > 100:
+                    if not torch.isfinite(applied_loss) or applied_loss > 50:
                         applied_loss = torch.tensor(1.0, device=device)
-                    if not torch.isfinite(rented_loss) or rented_loss > 100:
+                    if not torch.isfinite(rented_loss) or rented_loss > 50:
                         rented_loss = torch.tensor(1.0, device=device)
 
                     batch_loss = (toured_weight * toured_loss +
                                   applied_weight * applied_loss +
                                   rented_weight * rented_loss)
 
-                    # Final sanity check
-                    if not torch.isfinite(batch_loss) or batch_loss > 100:
+                    # Stricter clipping for batch loss
+                    if not torch.isfinite(batch_loss) or batch_loss > 50:
                         batch_loss = torch.tensor(3.0, device=device)
 
                     val_loss += batch_loss.item()
