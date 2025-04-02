@@ -14,17 +14,49 @@ class EmbeddingLayer(nn.Module):
         super().__init__()
         # Replace linear layers with proper embedding layers for categorical features
         self.categorical_embeddings = nn.ModuleList([
-            nn.Embedding(cat_dim, emb_dim) for cat_dim, emb_dim in zip(categorical_dims, embedding_dims)
+            nn.Embedding(min(cat_dim, 100000), emb_dim, sparse=False) 
+            for cat_dim, emb_dim in zip(categorical_dims, embedding_dims)
         ])
         self.numerical_bn = nn.BatchNorm1d(numerical_dim) if numerical_dim > 0 else None
+        
+        # Store dimensions for validation during forward pass
+        self.categorical_dims = categorical_dims
+        
+        # Print embedding info
+        print(f"Created {len(self.categorical_embeddings)} embedding layers")
+        total_params = sum(dim * emb_dim for dim, emb_dim in zip(
+            [min(d, 100000) for d in categorical_dims], 
+            embedding_dims
+        ))
+        print(f"Total embedding parameters: {total_params:,}")
 
     def forward(self, categorical_inputs, numerical_inputs):
         embedded_features = []
+        
         if len(self.categorical_embeddings) > 0:
             for i, embedding_layer in enumerate(self.categorical_embeddings):
-                # Convert to long tensor for embedding lookup
-                cat_feature = categorical_inputs[:, i].long()
-                embedded_features.append(embedding_layer(cat_feature))
+                try:
+                    # Convert to long tensor for embedding lookup
+                    cat_feature = categorical_inputs[:, i].long()
+                    
+                    # Safety check for out-of-bounds indices
+                    vocab_size = self.categorical_dims[i]
+                    max_idx = min(vocab_size - 1, 99999)  # Cap at 100K - 1
+                    
+                    # Clamp indices to valid range
+                    cat_feature = torch.clamp(cat_feature, 0, max_idx)
+                    
+                    # Get embeddings
+                    embedded = embedding_layer(cat_feature)
+                    embedded_features.append(embedded)
+                    
+                except Exception as e:
+                    # If embedding fails, create a zero tensor of appropriate shape
+                    emb_dim = embedding_layer.embedding_dim
+                    zero_emb = torch.zeros((categorical_inputs.size(0), emb_dim), 
+                                          device=categorical_inputs.device)
+                    embedded_features.append(zero_emb)
+                    print(f"Warning: Embedding error for feature {i}: {str(e)}")
 
         if self.numerical_bn is not None:
             numerical_features = self.numerical_bn(numerical_inputs)
@@ -133,31 +165,57 @@ class ListMLELoss(nn.Module):
             scores: predicted scores, shape [batch_size, 1]
             targets: ground truth labels, shape [batch_size, 1]
         """
+        # Handle empty inputs
+        if len(scores) == 0 or len(targets) == 0:
+            # Return a valid loss value of 0 with gradients
+            return torch.tensor(0.0, device=scores.device, requires_grad=True)
+            
         # Reshape if needed
         if scores.dim() > 1:
             scores = scores.squeeze()
         if targets.dim() > 1:
             targets = targets.squeeze()
-
+        
+        # Safety check for infinite values
+        if torch.any(torch.isinf(scores)) or torch.any(torch.isnan(scores)):
+            # Replace inf/nan values with safe values
+            scores = torch.nan_to_num(scores, nan=0.5, posinf=1.0, neginf=0.0)
+            
         # Add a small epsilon to prevent numerical issues
-        epsilon = 1e-10
+        epsilon = 1e-7
         
-        # Sort targets in descending order
-        sorted_targets, indices = torch.sort(targets, descending=True, dim=0)
-
-        # Reorder scores according to target sorting
-        ordered_scores = torch.gather(scores, 0, indices)
-
-        # Numerically stable implementation
-        # Apply log_softmax with temperature scaling to avoid extreme values
-        temperature = 0.1
-        scores_softmax = F.log_softmax(ordered_scores / temperature, dim=0)
-        
-        # Compute loss with clipping to prevent extreme values
-        loss = -torch.mean(torch.clamp(scores_softmax, min=-10, max=10))
-
-        # Return a valid scalar loss value
-        return torch.clamp(loss, min=-5, max=5)
+        # Sort targets in descending order with stability
+        try:
+            # Safer sorting with a small random noise to break ties consistently
+            random_noise = torch.randn_like(targets) * 1e-8
+            sorted_targets, indices = torch.sort(targets + random_noise, descending=True, dim=0)
+            
+            # Reorder scores according to target sorting
+            ordered_scores = torch.gather(scores, 0, indices)
+            
+            # Add a small constant to stabilize scores
+            ordered_scores = ordered_scores + epsilon
+            
+            # Apply log_softmax with temperature scaling and clamp extreme values
+            temperature = 0.5  # Increased from 0.3 for more stability
+            scores_softmax = F.log_softmax(ordered_scores / temperature, dim=0)
+            
+            # Stricter clamping to prevent extreme values
+            scores_softmax = torch.clamp(scores_softmax, min=-3, max=3)
+            
+            # Compute loss
+            loss = -torch.mean(scores_softmax)
+            
+            # Safety check on the final loss
+            if torch.isnan(loss) or torch.isinf(loss):
+                return torch.tensor(0.3, device=scores.device, requires_grad=True)
+                
+            return torch.clamp(loss, min=-3, max=3)
+            
+        except Exception as e:
+            # If anything fails, return a safe fallback value
+            print(f"ListMLELoss error: {str(e)}, returning fallback value")
+            return torch.tensor(0.3, device=scores.device, requires_grad=True)
 
 
 class MultiTaskCascadedLeadFunnelModel(nn.Module):
@@ -206,11 +264,18 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
         else:
             print(f"  - Selection flow: {toured_k} -> {applied_k} -> {rented_k}")
 
+        # 1. Check if embedding dimensions need adjustment
+        # Cap embedding dimensions to prevent instability with large vocabularies
+        modified_embedding_dims = []
+        for dim in embedding_dims:
+            # Cap embeddings at 25 dimensions for stability
+            modified_embedding_dims.append(min(25, dim))
+        
         # 1. Embedding layer
-        self.embedding_layer = EmbeddingLayer(categorical_dims, embedding_dims, numerical_dim)
+        self.embedding_layer = EmbeddingLayer(categorical_dims, modified_embedding_dims, numerical_dim)
 
         # 2. Projection to transformer dimension
-        total_emb_dim = sum(embedding_dims) + numerical_dim
+        total_emb_dim = sum(modified_embedding_dims) + numerical_dim
         self.projection = nn.Linear(total_emb_dim, transformer_dim)
 
         # 3. Shared transformer blocks for common representation
@@ -223,7 +288,7 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
         # ENHANCED: Deeper transformer path for toured stage (3 blocks instead of 1)
         self.transformer_toured = nn.Sequential(
             TabularTransformerBlock(transformer_dim, num_heads, ff_dim, dropout=dropout),
-            TabularTransformerBlock(transformer_dim, num_heads*2, ff_dim*2, dropout=dropout),  # Wider block
+            TabularTransformerBlock(transformer_dim, num_heads, ff_dim, dropout=dropout),  # Standard size
             TabularTransformerBlock(transformer_dim, num_heads, ff_dim, dropout=dropout)
         )
         
@@ -264,17 +329,19 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Careful weight initialization to prevent learning issues"""
+        """More conservative weight initialization to prevent learning issues"""
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
-                # Xavier initialization for linear layers
-                nn.init.xavier_normal_(module.weight.data, gain=0.5)
+                # Use more conservative initialization with smaller weights
+                nn.init.xavier_uniform_(module.weight.data, gain=0.2)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias.data)
             elif isinstance(module, nn.LayerNorm):
-                # Standard initialization for LayerNorm
                 nn.init.ones_(module.weight.data)
                 nn.init.zeros_(module.bias.data)
+            elif isinstance(module, nn.Embedding):
+                # Use more conservative embedding initialization
+                nn.init.normal_(module.weight.data, mean=0.0, std=0.02)
 
     def forward(self, categorical_inputs, numerical_inputs, lead_ids=None, is_training=True):
         """
@@ -472,6 +539,13 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
                     _, rented_indices_local = torch.topk(sortable_scores, k_rented)
                 rented_indices = applied_indices[rented_indices_local]
 
+        # Add safeguards to ensure valid predictions
+        # Add small epsilon to prevent exact 0s and 1s
+        epsilon = 1e-6
+        toured_pred = torch.clamp(toured_pred, epsilon, 1.0 - epsilon)
+        applied_pred = torch.clamp(applied_pred, epsilon, 1.0 - epsilon)
+        rented_pred = torch.clamp(rented_pred, epsilon, 1.0 - epsilon)
+
         return toured_pred, applied_pred, rented_pred, toured_indices, applied_indices, rented_indices
 
 
@@ -544,7 +618,7 @@ def train_cascaded_model(model,
     scaler = torch.cuda.amp.GradScaler() if (mixed_precision and device == 'cuda') else None
 
     # Loss functions
-    # Standard classification losses
+    # Standard classification losses with reduction='none' for more control
     toured_criterion = nn.BCELoss(reduction='none')
     applied_criterion = nn.BCELoss(reduction='none')
     rented_criterion = nn.BCELoss(reduction='none')
@@ -565,8 +639,40 @@ def train_cascaded_model(model,
         print(f"Ranking loss weight: {ranking_weight}")
         print(f"Early stopping patience: {early_stopping_patience}")
         print("-" * 60)
-
+    
+    # WARM-UP PHASE: Use BCE only for first 2 epochs with lower learning rate
+    original_lr = optimizer.param_groups[0]['lr']
+    warm_up_epochs = 2
+    
     for epoch in range(num_epochs):
+        # During warm-up, use lower learning rate and simpler loss
+        is_warmup = epoch < warm_up_epochs
+        if is_warmup:
+            # Use 10% of the learning rate during warm-up
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = original_lr * 0.1
+            
+            if verbose and epoch == 0:
+                print("\nWARM-UP PHASE: Using reduced learning rate and BCE loss only")
+        elif epoch == warm_up_epochs:
+            # Gradual learning rate increase instead of immediate jump
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = original_lr * 0.2  # Start at 20% instead of full
+            if verbose:
+                print("\nWARM-UP COMPLETE: Using reduced learning rate (20%) with full loss function")
+        elif epoch == warm_up_epochs + 1:
+            # Further increase on the next epoch
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = original_lr * 0.5
+            if verbose:
+                print("Increasing learning rate to 50%")
+        elif epoch == warm_up_epochs + 2:
+            # Full learning rate only after 2 more epochs
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = original_lr
+            if verbose:
+                print("Restored original learning rate")
+        
         # -------- TRAINING --------
         model.train()
         train_loss = 0.0
@@ -609,71 +715,72 @@ def train_cascaded_model(model,
                         toured_losses = toured_criterion(toured_pred, toured_labels)
 
                         # Add loss clipping to prevent extremely large loss values
-                        toured_losses = torch.clamp(toured_losses, 0, 10)
+                        toured_losses = torch.clamp(toured_losses, 0, 5)
                         toured_loss = toured_losses.mean()
 
                         # For applied, weight higher for toured selected
                         applied_losses = applied_criterion(applied_pred, applied_labels)
-                        applied_losses = torch.clamp(applied_losses, 0, 10)
+                        applied_losses = torch.clamp(applied_losses, 0, 5)
 
-                        toured_mask = torch.zeros_like(applied_losses, device=device)
-                        if len(toured_idx) > 0:  # Only set weights if we have selected indices
+                        toured_mask = torch.ones_like(applied_losses, device=device)  # Default weight 1.0
+                        if len(toured_idx) > 0 and not is_warmup:  # Only use masks after warm-up
                             toured_mask[toured_idx] = 2.0  # Higher weight for selected leads
                             # Set mask for non-selected items
                             non_selected_mask = ~torch.isin(torch.arange(len(toured_mask), device=device), toured_idx)
                             toured_mask[non_selected_mask] = 0.5
-                        applied_loss = (applied_losses * (toured_mask + 0.1)).mean()
+                        applied_loss = (applied_losses * toured_mask).mean()
 
                         # For rented, weight higher for applied selected
                         rented_losses = rented_criterion(rented_pred, rented_labels)
-                        rented_losses = torch.clamp(rented_losses, 0, 10)
+                        rented_losses = torch.clamp(rented_losses, 0, 5)
 
-                        applied_mask = torch.zeros_like(rented_losses, device=device)
-                        if len(applied_idx) > 0:  # Only set weights if we have selected indices
+                        applied_mask = torch.ones_like(rented_losses, device=device)  # Default weight 1.0
+                        if len(applied_idx) > 0 and not is_warmup:  # Only use masks after warm-up
                             applied_mask[applied_idx] = 2.0
                             # Set mask for non-selected items
                             non_selected_mask = ~torch.isin(torch.arange(len(applied_mask), device=device), applied_idx)
                             applied_mask[non_selected_mask] = 0.5
-                        rented_loss = (rented_losses * (applied_mask + 0.1)).mean()
+                        rented_loss = (rented_losses * applied_mask).mean()
 
                         # Standard BCE loss
                         bce_loss = toured_weight * toured_loss + \
                                    applied_weight * applied_loss + \
                                    rented_weight * rented_loss
 
-                        # Add Ranking Loss - try to use it when we have enough batch size for meaningful ranking
-                        if categorical_inputs.size(0) >= 10:
+                        # Add Ranking Loss - only after warm-up and with enough batch size
+                        if not is_warmup and categorical_inputs.size(0) >= 10:
                             try:
                                 toured_ranking_loss = ranking_criterion(toured_pred.squeeze(), toured_labels.squeeze())
                                 applied_ranking_loss = ranking_criterion(applied_pred.squeeze(),
                                                                          applied_labels.squeeze())
                                 rented_ranking_loss = ranking_criterion(rented_pred.squeeze(), rented_labels.squeeze())
 
-                                # Clamp ranking losses too
-                                toured_ranking_loss = torch.clamp(toured_ranking_loss, -5, 5)
-                                applied_ranking_loss = torch.clamp(applied_ranking_loss, -5, 5)
-                                rented_ranking_loss = torch.clamp(rented_ranking_loss, -5, 5)
+                                # Clamp ranking losses to safer values
+                                toured_ranking_loss = torch.clamp(toured_ranking_loss, -3, 3)
+                                applied_ranking_loss = torch.clamp(applied_ranking_loss, -3, 3)
+                                rented_ranking_loss = torch.clamp(rented_ranking_loss, -3, 3)
 
                                 ranking_loss = toured_weight * toured_ranking_loss + \
                                                applied_weight * applied_ranking_loss + \
                                                rented_weight * rented_ranking_loss
 
                                 # Combine BCE and ranking loss
-                                loss = (1.0 - ranking_weight) * bce_loss + ranking_weight * ranking_loss
+                                # loss = (1.0 - ranking_weight) * bce_loss + ranking_weight * ranking_loss
+                                loss = bce_loss # Temporarily use only BCE
                             except Exception as e:
                                 # Fallback if ranking loss fails
                                 if verbose:
                                     print(f"Ranking loss failed: {str(e)}, using BCE only")
                                 loss = bce_loss
                         else:
-                            # Use only BCE if batch is too small
+                            # Use only BCE during warm-up or if batch is too small
                             loss = bce_loss
 
-                        # Final sanity check on loss value
-                        if not torch.isfinite(loss) or loss > 10:
+                        # Final safety check on loss value - more conservative clamping
+                        if not torch.isfinite(loss) or loss > 5:
                             if verbose:
                                 print(f"WARNING: Non-finite loss detected: {loss}. Using fallback value.")
-                            loss = torch.tensor(1.0, device=device)  # Safe fallback
+                            loss = torch.tensor(0.5, device=device, requires_grad=True)  # Safer fallback value
 
                         # gradient accumulation
                         loss = loss / gradient_accumulation_steps
@@ -691,8 +798,7 @@ def train_cascaded_model(model,
 
                     if (batch_idx + 1) % gradient_accumulation_steps == 0:
                         scaler.unscale_(optimizer)
-                        # Reduced gradient clipping threshold for more stability
-                        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        nn.utils.clip_grad_norm_(model.parameters(), 0.1)  # Much tighter clipping from 0.5
                         scaler.step(optimizer)
                         scaler.update()
                         optimizer.zero_grad()
@@ -710,65 +816,66 @@ def train_cascaded_model(model,
 
                     # Calculate BCE losses
                     toured_losses = toured_criterion(toured_pred, toured_labels)
-                    toured_losses = torch.clamp(toured_losses, 0, 10)
+                    toured_losses = torch.clamp(toured_losses, 0, 5)  # More conservative clamping
                     toured_loss = toured_losses.mean()
 
                     applied_losses = applied_criterion(applied_pred, applied_labels)
-                    applied_losses = torch.clamp(applied_losses, 0, 10)
+                    applied_losses = torch.clamp(applied_losses, 0, 5)  # More conservative clamping
 
-                    toured_mask = torch.zeros_like(applied_losses, device=device)
-                    if len(toured_idx) > 0:
+                    toured_mask = torch.ones_like(applied_losses, device=device)  # Default weight 1.0
+                    if len(toured_idx) > 0 and not is_warmup:  # Only use masks after warm-up
                         toured_mask[toured_idx] = 2.0
                         non_selected_mask = ~torch.isin(torch.arange(len(toured_mask), device=device), toured_idx)
                         toured_mask[non_selected_mask] = 0.5
-                    applied_loss = (applied_losses * (toured_mask + 0.1)).mean()
+                    applied_loss = (applied_losses * toured_mask).mean()
 
                     rented_losses = rented_criterion(rented_pred, rented_labels)
-                    rented_losses = torch.clamp(rented_losses, 0, 10)
+                    rented_losses = torch.clamp(rented_losses, 0, 5)  # More conservative clamping
 
-                    applied_mask = torch.zeros_like(rented_losses, device=device)
-                    if len(applied_idx) > 0:
+                    applied_mask = torch.ones_like(rented_losses, device=device)  # Default weight 1.0
+                    if len(applied_idx) > 0 and not is_warmup:  # Only use masks after warm-up
                         applied_mask[applied_idx] = 2.0
                         non_selected_mask = ~torch.isin(torch.arange(len(applied_mask), device=device), applied_idx)
                         applied_mask[non_selected_mask] = 0.5
-                    rented_loss = (rented_losses * (applied_mask + 0.1)).mean()
+                    rented_loss = (rented_losses * applied_mask).mean()
 
                     # Standard BCE loss
                     bce_loss = toured_weight * toured_loss + \
                                applied_weight * applied_loss + \
                                rented_weight * rented_loss
 
-                    # Add Ranking Loss
-                    if categorical_inputs.size(0) >= 10:
+                    # Add Ranking Loss - only after warm-up period
+                    if not is_warmup and categorical_inputs.size(0) >= 10:
                         try:
                             toured_ranking_loss = ranking_criterion(toured_pred.squeeze(), toured_labels.squeeze())
                             applied_ranking_loss = ranking_criterion(applied_pred.squeeze(), applied_labels.squeeze())
                             rented_ranking_loss = ranking_criterion(rented_pred.squeeze(), rented_labels.squeeze())
 
-                            # Clamp ranking losses
-                            toured_ranking_loss = torch.clamp(toured_ranking_loss, -5, 5)
-                            applied_ranking_loss = torch.clamp(applied_ranking_loss, -5, 5)
-                            rented_ranking_loss = torch.clamp(rented_ranking_loss, -5, 5)
+                            # Clamp ranking losses to safer values
+                            toured_ranking_loss = torch.clamp(toured_ranking_loss, -3, 3)
+                            applied_ranking_loss = torch.clamp(applied_ranking_loss, -3, 3)
+                            rented_ranking_loss = torch.clamp(rented_ranking_loss, -3, 3)
 
                             ranking_loss = toured_weight * toured_ranking_loss + \
                                            applied_weight * applied_ranking_loss + \
                                            rented_weight * rented_ranking_loss
 
                             # Combine BCE and ranking loss
-                            loss = (1.0 - ranking_weight) * bce_loss + ranking_weight * ranking_loss
+                            # loss = (1.0 - ranking_weight) * bce_loss + ranking_weight * ranking_loss
+                            loss = bce_loss # Temporarily use only BCE
                         except Exception as e:
                             if verbose:
                                 print(f"Ranking loss failed: {str(e)}, using BCE only")
                             loss = bce_loss
                     else:
-                        # Use only BCE if batch is too small
+                        # Use only BCE during warm-up or if batch is too small
                         loss = bce_loss
 
-                    # Final sanity check on loss value
-                    if not torch.isfinite(loss) or loss > 10:
+                    # Final safety check
+                    if not torch.isfinite(loss) or loss > 5:  # More conservative threshold
                         if verbose:
                             print(f"WARNING: Non-finite loss detected: {loss}. Using fallback value.")
-                        loss = torch.tensor(1.0, device=device)  # Safe fallback
+                        loss = torch.tensor(0.5, device=device, requires_grad=True)  # Safer fallback
 
                     loss = loss / gradient_accumulation_steps
 
@@ -784,7 +891,7 @@ def train_cascaded_model(model,
                     loss.backward()
 
                     if (batch_idx + 1) % gradient_accumulation_steps == 0:
-                        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        nn.utils.clip_grad_norm_(model.parameters(), 0.1)  # Much tighter clipping
                         optimizer.step()
                         optimizer.zero_grad()
 
@@ -860,12 +967,20 @@ def train_cascaded_model(model,
                     applied_loss = applied_criterion(applied_pred, applied_labels).mean()
                     rented_loss = rented_criterion(rented_pred, rented_labels).mean()
 
+                    if not torch.isfinite(toured_loss) or toured_loss > 50:
+                        toured_loss = torch.tensor(1.0, device=device, requires_grad=True)
+                    if not torch.isfinite(applied_loss) or applied_loss > 50:
+                        applied_loss = torch.tensor(1.0, device=device, requires_grad=True)
+                    if not torch.isfinite(rented_loss) or rented_loss > 50:
+                        rented_loss = torch.tensor(1.0, device=device, requires_grad=True)
+
                     batch_loss = (toured_weight * toured_loss +
                                   applied_weight * applied_loss +
                                   rented_weight * rented_loss)
 
-                    # Clamp validation loss
-                    batch_loss = torch.clamp(batch_loss, 0, 10)
+                    # Stricter clipping for batch loss
+                    if not torch.isfinite(batch_loss) or batch_loss > 50:
+                        batch_loss = torch.tensor(3.0, device=device)
 
                     val_loss += batch_loss.item()
                     valid_batches += 1

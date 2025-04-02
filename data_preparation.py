@@ -20,7 +20,7 @@ def preprocess_data(
         target_cols=['TOTAL_APPOINTMENT_COMPLETED', 'TOTAL_APPLIED', 'TOTAL_RENTED'],
         test_size=0.2,
         random_state=42,
-        max_categories=100,
+        max_categories=100,  # Reduced from default to prevent too many categories
         save_preprocessors=True,
         preprocessors_path='./preprocessors',
         num_subsets=1,  # How many subsets to create (default=1 => no subsets, just entire data)
@@ -312,22 +312,39 @@ def preprocess_data(
         lead_ids = pd.Series(np.arange(len(X)))
         print("* No CLIENT_PERSON_ID found, creating sequential IDs")
 
-    # Identify categorical vs numerical columns
+    # Identify categorical vs numerical columns - with better high-cardinality handling
     categorical_cols = []
     numerical_cols = []
+    high_cardinality_cols = []
+    
     for col in X.columns:
-        if X[col].dtype == 'object' or (X[col].dtype in ['int64', 'float64'] and X[col].nunique() < 20):
-            if X[col].nunique() <= max_categories:
+        n_unique = X[col].nunique()
+        if X[col].dtype == 'object' or (X[col].dtype in ['int64', 'float64'] and n_unique < 20):
+            if n_unique <= max_categories:
                 categorical_cols.append(col)
+            else:
+                # For high-cardinality categorical columns, either:
+                # 1. Treat as numerical if numeric type
+                # 2. Drop if text type with too many values (would create huge embeddings)
+                if X[col].dtype in ['int64', 'float64']:
+                    numerical_cols.append(col)
+                    print(f"* Moving high-cardinality column '{col}' ({n_unique} values) to numerical features")
+                else:
+                    high_cardinality_cols.append(col)
+                    print(f"* Dropping high-cardinality column '{col}' ({n_unique} values) to prevent memory issues")
         elif X[col].dtype in ['int64', 'float64']:
             numerical_cols.append(col)
 
+    # Drop high-cardinality categorical columns to prevent embedding explosion
+    X = X.drop(columns=high_cardinality_cols, errors='ignore')
+    
     print(f"* Identified {len(categorical_cols)} categorical columns and {len(numerical_cols)} numerical columns")
+    print(f"* Dropped {len(high_cardinality_cols)} high-cardinality categorical columns to prevent memory issues")
 
     print("\n6. Handling Missing Values...")
     print("-"*40)
     # Handle missing values
-    # For numerical: impute with median
+    # For numerical: impute with median and handle infinity values
     numerical_data = X[numerical_cols].copy()
 
     # Check for columns with all missing values
@@ -337,8 +354,39 @@ def preprocess_data(
         numerical_data = numerical_data.drop(columns=all_missing)
         numerical_cols = [col for col in numerical_cols if col not in all_missing]
 
-    # Now impute
-    numerical_data = numerical_data.fillna(numerical_data.median())
+    # Handle infinity values
+    for col in numerical_cols:
+        if numerical_data[col].dtype in ['int64', 'float64']:
+            # Replace inf/-inf with NaN first
+            mask = np.isinf(numerical_data[col])
+            if mask.any():
+                num_inf = mask.sum()
+                print(f"* Replacing {num_inf} infinity values in '{col}' with NaN")
+                numerical_data.loc[mask, col] = np.nan
+    
+    # Now impute with median
+    for col in numerical_cols:
+        median_val = numerical_data[col].median()
+        if pd.isna(median_val):
+            # If median is NaN, use 0 instead
+            median_val = 0
+            print(f"* Column '{col}' has NaN median, using 0 for imputation")
+        numerical_data[col] = numerical_data[col].fillna(median_val)
+    
+    # Clip extreme values to prevent training instability
+    for col in numerical_cols:
+        if numerical_data[col].dtype in ['float64']:
+            q1 = numerical_data[col].quantile(0.01)
+            q3 = numerical_data[col].quantile(0.99)
+            # Wider range to preserve more data while removing extremes
+            lower_bound = q1 - 5 * (q3 - q1)
+            upper_bound = q3 + 5 * (q3 - q1)
+            
+            # Count and clip outliers
+            outliers = ((numerical_data[col] < lower_bound) | (numerical_data[col] > upper_bound)).sum()
+            if outliers > 0:
+                print(f"* Clipping {outliers} extreme values in '{col}'")
+                numerical_data[col] = numerical_data[col].clip(lower_bound, upper_bound)
 
     # For categorical: impute with mode
     categorical_data = X[categorical_cols].copy()
@@ -348,7 +396,13 @@ def preprocess_data(
             print(f"Warning: Categorical column '{col}' has all missing values. Using default value 'missing'")
             categorical_data[col] = 'missing'
         else:
-            categorical_data[col] = categorical_data[col].fillna(categorical_data[col].mode()[0])
+            # Get the mode, but default to 'missing' if there's an issue
+            try:
+                mode_val = categorical_data[col].mode()[0]
+                categorical_data[col] = categorical_data[col].fillna(mode_val)
+            except:
+                print(f"* Error finding mode for '{col}', using 'missing' value")
+                categorical_data[col] = categorical_data[col].fillna('missing')
 
     # ---------- HELPER FUNCTION FOR BUILDING A SINGLE (train_dataset, test_dataset) -----------
     def build_dataset_splits(cat_data, num_data, y_tour, y_app, y_rent, lead_id_array):
@@ -408,8 +462,18 @@ def preprocess_data(
                 try:
                     # Create a label encoder for this column
                     label_encoder = LabelEncoder()
-                    # Fit on both train and test to ensure all categories are captured
+                    # Ensure values are strings and handle special characters
                     combined_values = pd.concat([X_train_cat[col], X_test_cat[col]]).astype(str)
+                    
+                    # Limit the number of unique categories to prevent memory issues
+                    if len(combined_values.unique()) > 1000:
+                        print(f"Warning: Column {col} has {len(combined_values.unique())} unique values. " +
+                              f"Limiting to top 1000 most frequent.")
+                        value_counts = combined_values.value_counts().nlargest(999)
+                        top_values = set(value_counts.index)
+                        # Replace rare values with 'rare'
+                        combined_values = combined_values.apply(lambda x: x if x in top_values else 'rare')
+                        
                     label_encoder.fit(combined_values)
                     
                     # Transform train and test data
@@ -439,8 +503,37 @@ def preprocess_data(
         # Scale numerical
         if X_train_num.shape[1] > 0:
             scaler = StandardScaler()
-            X_train_num_scaled = scaler.fit_transform(X_train_num)
-            X_test_num_scaled = scaler.transform(X_test_num)
+            
+            # Create a copy of data for safer manipulation
+            X_train_num_safe = X_train_num.copy()
+            X_test_num_safe = X_test_num.copy()
+            
+            # Replace any remaining inf values with large finite numbers
+            X_train_num_safe = np.nan_to_num(X_train_num_safe, nan=0, posinf=1e6, neginf=-1e6)
+            X_test_num_safe = np.nan_to_num(X_test_num_safe, nan=0, posinf=1e6, neginf=-1e6)
+            
+            # Fit and transform with robust handling
+            try:
+                X_train_num_scaled = scaler.fit_transform(X_train_num_safe)
+                X_test_num_scaled = scaler.transform(X_test_num_safe)
+                
+                # Additional post-scaling outlier clipping for stability
+                # Clip to reasonable range to prevent extreme values
+                X_train_num_scaled = np.clip(X_train_num_scaled, -10, 10)
+                X_test_num_scaled = np.clip(X_test_num_scaled, -10, 10)
+            except Exception as e:
+                print(f"Warning: Scaling error: {str(e)}, using simple standardization")
+                # Fallback to simpler standardization
+                means = np.nanmean(X_train_num_safe, axis=0)
+                stds = np.nanstd(X_train_num_safe, axis=0)
+                stds[stds == 0] = 1  # Prevent division by zero
+                
+                X_train_num_scaled = (X_train_num_safe - means) / stds
+                X_test_num_scaled = (X_test_num_safe - means) / stds
+                
+                # Clip values for stability
+                X_train_num_scaled = np.clip(X_train_num_scaled, -10, 10)
+                X_test_num_scaled = np.clip(X_test_num_scaled, -10, 10)
         else:
             print("Warning: No numerical features available")
             # Create empty array with correct shape
@@ -448,46 +541,60 @@ def preprocess_data(
             X_test_num_scaled = np.zeros((len(X_test_num), 0))
             scaler = None
 
-        # Convert to tensors
-        X_train_cat_tensor = torch.tensor(X_train_cat_encoded.values, dtype=torch.long)
-        X_test_cat_tensor = torch.tensor(X_test_cat_encoded.values, dtype=torch.long)
-        X_train_num_tensor = torch.tensor(X_train_num_scaled, dtype=torch.float32)
-        X_test_num_tensor = torch.tensor(X_test_num_scaled, dtype=torch.float32)
-
-        # Handle labels
-        y_train_toured_tensor = torch.tensor(
-            y_train_toured if isinstance(y_train_toured, np.ndarray) else y_train_toured.values,
-            dtype=torch.float32).view(-1, 1)
-        y_test_toured_tensor = torch.tensor(
-            y_test_toured if isinstance(y_test_toured, np.ndarray) else y_test_toured.values,
-            dtype=torch.float32).view(-1, 1)
-        y_train_applied_tensor = torch.tensor(
-            y_train_applied if isinstance(y_train_applied, np.ndarray) else y_train_applied.values,
-            dtype=torch.float32).view(-1, 1)
-        y_test_applied_tensor = torch.tensor(
-            y_test_applied if isinstance(y_test_applied, np.ndarray) else y_test_applied.values,
-            dtype=torch.float32).view(-1, 1)
-        y_train_rent_tensor = torch.tensor(
-            y_train_rent if isinstance(y_train_rent, np.ndarray) else y_train_rent.values,
-            dtype=torch.float32).view(-1, 1)
-        y_test_rent_tensor = torch.tensor(
-            y_test_rent if isinstance(y_test_rent, np.ndarray) else y_test_rent.values,
-            dtype=torch.float32).view(-1, 1)
+        # Convert to tensors with proper dtype specification and validation
+        try:
+            # Ensure categorical data is integer for embedding lookup
+            X_train_cat_tensor = torch.tensor(X_train_cat_encoded.values, dtype=torch.long)
+            X_test_cat_tensor = torch.tensor(X_test_cat_encoded.values, dtype=torch.long)
+            
+            # Ensure numerical data is float
+            X_train_num_tensor = torch.tensor(X_train_num_scaled, dtype=torch.float32)
+            X_test_num_tensor = torch.tensor(X_test_num_scaled, dtype=torch.float32)
+            
+            # Handle labels - ensure they're clean floats between 0-1
+            y_train_toured_np = np.clip(y_train_toured.values if isinstance(y_train_toured, pd.Series) else y_train_toured, 0, 1)
+            y_test_toured_np = np.clip(y_test_toured.values if isinstance(y_test_toured, pd.Series) else y_test_toured, 0, 1)
+            
+            y_train_applied_np = np.clip(y_train_applied.values if isinstance(y_train_applied, pd.Series) else y_train_applied, 0, 1)
+            y_test_applied_np = np.clip(y_test_applied.values if isinstance(y_test_applied, pd.Series) else y_test_applied, 0, 1)
+            
+            y_train_rent_np = np.clip(y_train_rent.values if isinstance(y_train_rent, pd.Series) else y_train_rent, 0, 1)
+            y_test_rent_np = np.clip(y_test_rent.values if isinstance(y_test_rent, pd.Series) else y_test_rent, 0, 1)
+            
+            # Convert to tensors with proper shape
+            y_train_toured_tensor = torch.tensor(y_train_toured_np, dtype=torch.float32).view(-1, 1)
+            y_test_toured_tensor = torch.tensor(y_test_toured_np, dtype=torch.float32).view(-1, 1)
+            
+            y_train_applied_tensor = torch.tensor(y_train_applied_np, dtype=torch.float32).view(-1, 1)
+            y_test_applied_tensor = torch.tensor(y_test_applied_np, dtype=torch.float32).view(-1, 1)
+            
+            y_train_rent_tensor = torch.tensor(y_train_rent_np, dtype=torch.float32).view(-1, 1)
+            y_test_rent_tensor = torch.tensor(y_test_rent_np, dtype=torch.float32).view(-1, 1)
+            
+            # Prepare lead IDs
+            train_ids_tensor = torch.tensor(train_ids.values if isinstance(train_ids, pd.Series) else train_ids)
+            test_ids_tensor = torch.tensor(test_ids.values if isinstance(test_ids, pd.Series) else test_ids)
+            
+        except Exception as e:
+            print(f"Error creating tensors: {str(e)}")
+            raise
 
         # Create dataset objects
         train_dataset = LeadDataset(
             X_train_cat_tensor, X_train_num_tensor,
             y_train_toured_tensor, y_train_applied_tensor, y_train_rent_tensor,
-            torch.tensor(train_ids.values if isinstance(train_ids, pd.Series) else train_ids)
+            train_ids_tensor
         )
         test_dataset = LeadDataset(
             X_test_cat_tensor, X_test_num_tensor,
             y_test_toured_tensor, y_test_applied_tensor, y_test_rent_tensor,
-            torch.tensor(test_ids.values if isinstance(test_ids, pd.Series) else test_ids)
+            test_ids_tensor
         )
 
-        # Note: We don't need to change the cat_dims calculation anymore
-        # since we're directly calculating it during encoding
+        # Print dataset statistics for debugging
+        print(f"Created datasets - Train: {len(train_dataset)} examples, Test: {len(test_dataset)} examples")
+        print(f"Categorical features: {X_train_cat_tensor.shape[1]}, Numerical features: {X_train_num_tensor.shape[1]}")
+        
         numerical_dim = X_train_num_scaled.shape[1]
         feature_names = list(X_train_cat_encoded.columns) + list(num_data.columns)
 

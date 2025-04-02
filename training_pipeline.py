@@ -419,15 +419,15 @@ def train_model(model,
 
                         # Check for NaN/Inf with strict replacement
                         if torch.isnan(toured_loss) or torch.isinf(toured_loss) or toured_loss > 10:
-                            toured_loss = torch.tensor(0.5, device=device)
+                            toured_loss = torch.tensor(0.5, device=device, requires_grad=True)
                             print(f"Warning: Replaced extreme toured loss")
 
                         if torch.isnan(applied_loss) or torch.isinf(applied_loss) or applied_loss > 10:
-                            applied_loss = torch.tensor(0.5, device=device)
+                            applied_loss = torch.tensor(0.5, device=device, requires_grad=True)
                             print(f"Warning: Replaced extreme applied loss")
 
                         if torch.isnan(rented_loss) or torch.isinf(rented_loss) or rented_loss > 10:
-                            rented_loss = torch.tensor(0.5, device=device)
+                            rented_loss = torch.tensor(0.5, device=device, requires_grad=True)
                             print(f"Warning: Replaced extreme rented loss")
 
                         # Combine loss with weighting
@@ -469,7 +469,7 @@ def train_model(model,
                         # Final sanity check with strict limits
                         if not torch.isfinite(loss) or loss > 10:
                             print(f"WARNING: Non-finite loss detected: {loss}. Using fallback value.")
-                            loss = torch.tensor(1.0, device=device)  # Safe fallback
+                            loss = torch.tensor(1.0, device=device, requires_grad=True)  # Safe fallback
 
                         # gradient accumulation
                         loss = loss / gradient_accumulation_steps
@@ -503,15 +503,15 @@ def train_model(model,
 
                     # Check for extreme values
                     if torch.isnan(toured_loss) or torch.isinf(toured_loss) or toured_loss > 10:
-                        toured_loss = torch.tensor(0.5, device=device)
+                        toured_loss = torch.tensor(0.5, device=device, requires_grad=True)
                         print(f"Warning: Replaced extreme toured loss")
 
                     if torch.isnan(applied_loss) or torch.isinf(applied_loss) or applied_loss > 10:
-                        applied_loss = torch.tensor(0.5, device=device)
+                        applied_loss = torch.tensor(0.5, device=device, requires_grad=True)
                         print(f"Warning: Replaced extreme applied loss")
 
                     if torch.isnan(rented_loss) or torch.isinf(rented_loss) or rented_loss > 10:
-                        rented_loss = torch.tensor(0.5, device=device)
+                        rented_loss = torch.tensor(0.5, device=device, requires_grad=True)
                         print(f"Warning: Replaced extreme rented loss")
 
                     # Standard loss calculation
@@ -549,7 +549,7 @@ def train_model(model,
                     # Final sanity check
                     if not torch.isfinite(loss) or loss > 10:
                         print(f"WARNING: Non-finite loss detected: {loss}. Using fallback value.")
-                        loss = torch.tensor(1.0, device=device)  # Safe fallback
+                        loss = torch.tensor(1.0, device=device, requires_grad=True)  # Safe fallback
 
                     loss = loss / gradient_accumulation_steps
                     loss.backward()
@@ -607,11 +607,11 @@ def train_model(model,
 
                     # Handle extreme values - stricter clipping to prevent huge loss values
                     if not torch.isfinite(toured_loss) or toured_loss > 50:
-                        toured_loss = torch.tensor(1.0, device=device)
+                        toured_loss = torch.tensor(1.0, device=device, requires_grad=True)
                     if not torch.isfinite(applied_loss) or applied_loss > 50:
-                        applied_loss = torch.tensor(1.0, device=device)
+                        applied_loss = torch.tensor(1.0, device=device, requires_grad=True)
                     if not torch.isfinite(rented_loss) or rented_loss > 50:
-                        rented_loss = torch.tensor(1.0, device=device)
+                        rented_loss = torch.tensor(1.0, device=device, requires_grad=True)
 
                     batch_loss = (toured_weight * toured_loss +
                                   applied_weight * applied_loss +
@@ -619,7 +619,7 @@ def train_model(model,
 
                     # Stricter clipping for batch loss
                     if not torch.isfinite(batch_loss) or batch_loss > 50:
-                        batch_loss = torch.tensor(3.0, device=device)
+                        batch_loss = torch.tensor(3.0, device=device, requires_grad=True)
 
                     val_loss += batch_loss.item()
 

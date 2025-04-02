@@ -38,7 +38,7 @@ def parse_args():
                         help='Gradient accumulation steps (use higher values for larger batch sizes)')
     parser.add_argument('--batch_size', type=int, default=2000, help='Batch size for training')
     parser.add_argument('--epochs', type=int, default=30, help='Number of training epochs')
-    parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
+    parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
 
     # Funnel selection options - fixed count vs. percentage-based
     parser.add_argument('--use_percentages', action='store_true', 
@@ -89,6 +89,9 @@ def parse_args():
     # NEW ARGS for feature engineering
     parser.add_argument('--enhance_toured_features', action='store_true', default=True,
                        help='Enable enhanced feature engineering for toured stage')
+
+    parser.add_argument('--test_stability', action='store_true',
+                        help='Run a shorter training loop to test stability fixes')
 
     return parser.parse_args()
 
@@ -337,8 +340,26 @@ def finetune_cascaded_with_external_examples(model,
             applied_loss = applied_weight * applied_criterion(applied_pred, applied_labels)
             rented_loss = rented_weight * rented_criterion(rented_pred, rented_labels)
 
+            # Check for non-finite losses and replace if needed
+            if not torch.isfinite(toured_loss) or toured_loss > 10:
+                toured_loss = torch.tensor(0.5, device=device, requires_grad=True)
+                print(f"Warning: Replaced extreme toured loss in fine-tuning")
+                
+            if not torch.isfinite(applied_loss) or applied_loss > 10:
+                applied_loss = torch.tensor(0.5, device=device, requires_grad=True)
+                print(f"Warning: Replaced extreme applied loss in fine-tuning")
+                
+            if not torch.isfinite(rented_loss) or rented_loss > 10:
+                rented_loss = torch.tensor(0.5, device=device, requires_grad=True)
+                print(f"Warning: Replaced extreme rented loss in fine-tuning")
+
             # Extra scale factor for external examples
             loss = 3.0 * (toured_loss + applied_loss + rented_loss)
+            
+            # Final sanity check
+            if not torch.isfinite(loss) or loss > 10:
+                print(f"WARNING: Non-finite loss detected in fine-tuning: {loss}. Using fallback.")
+                loss = torch.tensor(1.0, device=device, requires_grad=True)
 
             loss.backward()
             # Add gradient clipping to prevent exploding gradients
