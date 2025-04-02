@@ -11,6 +11,10 @@ from tqdm import tqdm
 import os
 import joblib
 from sklearn.metrics import roc_auc_score, average_precision_score
+import csv
+
+# Import FocalLoss from model_architecture
+from model_architecture import FocalLoss
 
 
 # ----------------
@@ -260,9 +264,11 @@ def finetune_with_external_examples(model,
     Optionally incorporate new examples or corrected data
     by running a short fine-tuning loop.
     """
-    toured_criterion = nn.BCELoss()
-    applied_criterion = nn.BCELoss()
-    rented_criterion = nn.BCELoss()
+    # Use FocalLoss instead of BCELoss for consistency
+    # Set alpha appropriately (assuming external data might also be imbalanced)
+    toured_criterion = FocalLoss(alpha=0.25, gamma=2.0, reduction='mean')
+    applied_criterion = FocalLoss(alpha=0.75, gamma=2.0, reduction='mean')
+    rented_criterion = FocalLoss(alpha=0.75, gamma=2.0, reduction='mean')
 
     # Add ranking loss
     ranking_criterion = nn.BCELoss()  # placeholder, will use model's ranking loss if available
@@ -367,7 +373,8 @@ def train_model(model,
         'toured_auc': [], 'applied_auc': [], 'rented_auc': [],
         'toured_apr': [], 'applied_apr': [], 'rented_apr': [],
         'toured_p10': [], 'applied_p10': [], 'rented_p10': [],  # Added Precision@10
-        'toured_p50': [], 'applied_p50': [], 'rented_p50': []  # Added Precision@50
+        'toured_p50': [], 'applied_p50': [], 'rented_p50': [],  # Added Precision@50
+        'toured_pmax': [], 'applied_pmax': [], 'rented_pmax': []  # Added Precision@max
     }
 
     print(f"\nStarting training for {num_epochs} epochs with device={device}")
@@ -466,108 +473,25 @@ def train_model(model,
                         else:
                             loss = bce_loss
 
-                        # Final sanity check with strict limits
-                        if not torch.isfinite(loss) or loss > 10:
-                            print(f"WARNING: Non-finite loss detected: {loss}. Using fallback value.")
-                            loss = torch.tensor(1.0, device=device, requires_grad=True)  # Safe fallback
+                loss = loss / gradient_accumulation_steps
 
-                        # gradient accumulation
-                        loss = loss / gradient_accumulation_steps
+                scaler.scale(loss).backward()
 
-                    scaler.scale(loss).backward()
-
-                    if (batch_idx + 1) % gradient_accumulation_steps == 0:
-                        scaler.unscale_(optimizer)
-                        nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Stricter gradient clipping
-                        scaler.step(optimizer)
-                        scaler.update()
-                        optimizer.zero_grad()
-                else:
-                    # No mixed precision - similar logic but without scaler
-                    outputs = model(categorical_inputs, numerical_inputs, lead_ids)
-                    if isinstance(outputs, tuple) and len(outputs) >= 3:
-                        toured_pred, applied_pred, rented_pred = outputs[:3]
-                    else:
-                        toured_pred, applied_pred, rented_pred = outputs
-
-                    # Add epsilon to prevent exact 0s and 1s
-                    epsilon = 1e-7
-                    toured_pred = torch.clamp(toured_pred, epsilon, 1 - epsilon)
-                    applied_pred = torch.clamp(applied_pred, epsilon, 1 - epsilon)
-                    rented_pred = torch.clamp(rented_pred, epsilon, 1 - epsilon)
-
-                    # Standard loss calculation
-                    toured_loss = toured_criterion(toured_pred, toured_labels)
-                    applied_loss = applied_criterion(applied_pred, applied_labels)
-                    rented_loss = rented_criterion(rented_pred, rented_labels)
-
-                    # Check for extreme values
-                    if torch.isnan(toured_loss) or torch.isinf(toured_loss) or toured_loss > 10:
-                        toured_loss = torch.tensor(0.5, device=device, requires_grad=True)
-                        print(f"Warning: Replaced extreme toured loss")
-
-                    if torch.isnan(applied_loss) or torch.isinf(applied_loss) or applied_loss > 10:
-                        applied_loss = torch.tensor(0.5, device=device, requires_grad=True)
-                        print(f"Warning: Replaced extreme applied loss")
-
-                    if torch.isnan(rented_loss) or torch.isinf(rented_loss) or rented_loss > 10:
-                        rented_loss = torch.tensor(0.5, device=device, requires_grad=True)
-                        print(f"Warning: Replaced extreme rented loss")
-
-                    # Standard loss calculation
-                    bce_loss = toured_weight * toured_loss + \
-                               applied_weight * applied_loss + \
-                               rented_weight * rented_loss
-
-                    # Add ranking loss if model supports it and batch size large enough
-                    if ranking_criterion and categorical_inputs.size(0) >= 10:
-                        try:
-                            from model_architecture import ListMLELoss
-                            ranking_module = ListMLELoss()
-
-                            toured_ranking_loss = ranking_module(toured_pred.squeeze(), toured_labels.squeeze())
-                            applied_ranking_loss = ranking_module(applied_pred.squeeze(), applied_labels.squeeze())
-                            rented_ranking_loss = ranking_module(rented_pred.squeeze(), rented_labels.squeeze())
-
-                            # Clamp ranking losses with stricter bounds
-                            toured_ranking_loss = torch.clamp(toured_ranking_loss, -5, 5)
-                            applied_ranking_loss = torch.clamp(applied_ranking_loss, -5, 5)
-                            rented_ranking_loss = torch.clamp(rented_ranking_loss, -5, 5)
-
-                            rank_loss = toured_weight * toured_ranking_loss + \
-                                        applied_weight * applied_ranking_loss + \
-                                        rented_weight * rented_ranking_loss
-
-                            # Combine BCE and ranking loss
-                            loss = (1.0 - ranking_weight) * bce_loss + ranking_weight * rank_loss
-                        except Exception as e:
-                            print(f"Ranking loss failed: {str(e)}, using BCE only")
-                            loss = bce_loss
-                    else:
-                        loss = bce_loss
-
-                    # Final sanity check
-                    if not torch.isfinite(loss) or loss > 10:
-                        print(f"WARNING: Non-finite loss detected: {loss}. Using fallback value.")
-                        loss = torch.tensor(1.0, device=device, requires_grad=True)  # Safe fallback
-
-                    loss = loss / gradient_accumulation_steps
-                    loss.backward()
-
-                    if (batch_idx + 1) % gradient_accumulation_steps == 0:
-                        nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Stricter gradient clipping
-                        optimizer.step()
-                        optimizer.zero_grad()
-
-                train_loss += loss.item() * gradient_accumulation_steps
-                train_iter.set_postfix({'loss': float(loss.item() * gradient_accumulation_steps)})
-                num_batches += 1
-
+                if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Stricter gradient clipping
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
             except Exception as e:
                 print(f"Error in training batch {batch_idx}: {str(e)}")
                 print(f"Batch shapes: cat={categorical_inputs.shape}, num={numerical_inputs.shape}")
                 # Skip this batch and continue
                 continue
+
+            train_loss += loss.item() * gradient_accumulation_steps
+            train_iter.set_postfix({'loss': float(loss.item() * gradient_accumulation_steps)})
+            num_batches += 1
 
         train_loss /= max(1, num_batches)
         history['train_loss'].append(train_loss)
@@ -671,6 +595,12 @@ def train_model(model,
         applied_p50 = precision_at_k(applied_true.flatten(), applied_preds.flatten(), k50)
         rented_p50 = precision_at_k(rented_true.flatten(), rented_preds.flatten(), k50)
 
+        # Precision@max (using all examples)
+        k_max = len(toured_true)
+        toured_pmax = precision_at_k(toured_true.flatten(), toured_preds.flatten(), k_max)
+        applied_pmax = precision_at_k(applied_true.flatten(), applied_preds.flatten(), k_max)
+        rented_pmax = precision_at_k(rented_true.flatten(), rented_preds.flatten(), k_max)
+
         # Store all metrics
         history['toured_auc'].append(toured_auc)
         history['applied_auc'].append(applied_auc)
@@ -684,17 +614,21 @@ def train_model(model,
         history['toured_p50'].append(toured_p50)
         history['applied_p50'].append(applied_p50)
         history['rented_p50'].append(rented_p50)
+        history['toured_pmax'].append(toured_pmax)
+        history['applied_pmax'].append(applied_pmax)
+        history['rented_pmax'].append(rented_pmax)
 
         # Print metrics with clear formatting and line breaks
         print(f"\nEpoch {epoch + 1}/{num_epochs}")
         print("-" * 80)
         print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
         print("\nMetrics:")
-        print(f"{'Stage':<10} {'AUC':<10} {'APR':<10} {'P@10':<10} {'P@50':<10}")
+        print(f"{'Stage':<10} {'AUC':<10} {'APR':<10} {'P@10':<10} {'P@max':<10}")
         print("-" * 80)
-        print(f"{'Toured':<10} {toured_auc:.4f}     {toured_apr:.4f}     {toured_p10:.4f}     {toured_p50:.4f}")
-        print(f"{'Applied':<10} {applied_auc:.4f}     {applied_apr:.4f}     {applied_p10:.4f}     {applied_p50:.4f}")
-        print(f"{'Rented':<10} {rented_auc:.4f}     {rented_apr:.4f}     {rented_p10:.4f}     {rented_p50:.4f}")
+        print(f"{'Toured':<10} {toured_auc:.4f}     {toured_apr:.4f}     {toured_p10:.4f}     {toured_pmax:.4f}")
+        print(f"{'Applied':<10} {applied_auc:.4f}     {applied_apr:.4f}     {applied_p10:.4f}     {applied_pmax:.4f}")
+        print(f"{'Rented':<10} {rented_auc:.4f}     {rented_apr:.4f}     {rented_p10:.4f}     {rented_pmax:.4f}")
+        print(f"Max predictions: {k_max}")
         print("-" * 80 + "\n")
 
         # Step LR scheduler
@@ -711,12 +645,12 @@ def train_model(model,
                 print(f"Early stopping triggered after {epoch + 1} epochs")
                 break
 
-    # Load best state
-    try:
-        model.load_state_dict(torch.load(model_save_path))
-    except Exception as e:
-        print(f"Error loading best model state: {str(e)}")
-        print("Continuing with current model state...")
+        # Load best state
+        try:
+            model.load_state_dict(torch.load(model_save_path))
+        except Exception as e:
+            print(f"Error loading best model state: {str(e)}")
+            print("Continuing with current model state...")
 
     return model, history
 

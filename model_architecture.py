@@ -7,6 +7,26 @@ import csv
 import os
 
 
+def safe_loss(loss, max_value=2.0, fallback=1.0, name=""):
+    """
+    Helper function to handle NaN, Inf, or extremely large loss values.
+    Returns a clamped value or fallback if the loss is problematic.
+    
+    Args:
+        loss: The loss tensor
+        max_value: Maximum value before considering it problematic
+        fallback: Value to use if loss is problematic
+        name: Name of the loss for logging purposes
+        
+    Returns:
+        Safe loss value that can be backpropagated
+    """
+    if not torch.isfinite(loss) or loss > max_value:
+        # print(f"WARNING: Detected problematic {name} loss value: {loss.item() if torch.isfinite(loss) else 'NaN/Inf'}. Using fallback.")
+        return torch.tensor(fallback, device=loss.device, requires_grad=True)
+    return loss
+
+
 class EmbeddingLayer(nn.Module):
     """Handles embedding of categorical features and processing of numerical features"""
 
@@ -97,6 +117,14 @@ class TabularTransformerBlock(nn.Module):
         # Reshape for attention
         batch_size = x.size(0)
 
+        # Add numerical stability safeguards
+        # Check for NaN values and replace with zeros
+        if torch.isnan(x).any():
+            x = torch.nan_to_num(x, nan=0.0)
+        
+        # Clip large values to prevent overflow
+        x = torch.clamp(x, min=-100, max=100)
+
         # Ensure x is shaped appropriately for the transformer block
         if x.dim() == 2:
             # Reshape to (batch_size, seq_len=1, embed_dim)
@@ -114,17 +142,26 @@ class TabularTransformerBlock(nn.Module):
                 # Reshape to (batch_size, seq_len, embed_dim)
                 x = x.view(batch_size, seq_len, self.embed_dim)
 
-        # Apply attention mechanism
+        # Apply attention mechanism with stability safeguards
         attn_out, _ = self.mha(x, x, x)
+        # Add stability clipping
+        attn_out = torch.clamp(attn_out, min=-100, max=100)
         x = self.norm1(x + attn_out)
 
-        # Apply feed-forward
+        # Apply feed-forward with stability measures
         ffn_out = self.ffn(x)
         ffn_out = self.dropout(ffn_out)
+        # Add stability clipping
+        ffn_out = torch.clamp(ffn_out, min=-100, max=100)
         out = self.norm2(x + ffn_out)
 
         # Use mean pooling to get fixed-size representation
         out = out.mean(dim=1)  # Shape: (batch_size, embed_dim)
+        
+        # Final stability check
+        out = torch.nan_to_num(out, nan=0.0)
+        out = torch.clamp(out, min=-100, max=100)
+        
         return out
 
 
@@ -152,8 +189,7 @@ class PredictionHead(nn.Module):
 class ListMLELoss(nn.Module):
     """
     ListMLE (Maximum Likelihood Estimation) loss for learning to rank.
-
-    Paper: "Listwise Approach to Learning to Rank - Theory and Algorithm"
+    Enhanced with numerical stability safeguards.
     """
 
     def __init__(self):
@@ -176,46 +212,53 @@ class ListMLELoss(nn.Module):
         if targets.dim() > 1:
             targets = targets.squeeze()
         
-        # Safety check for infinite values
-        if torch.any(torch.isinf(scores)) or torch.any(torch.isnan(scores)):
-            # Replace inf/nan values with safe values
-            scores = torch.nan_to_num(scores, nan=0.5, posinf=1.0, neginf=0.0)
-            
+        # Safety check for infinite values - more strict cleaning
+        scores = torch.nan_to_num(scores, nan=0.5, posinf=0.99, neginf=0.01)
+        
         # Add a small epsilon to prevent numerical issues
-        epsilon = 1e-7
+        epsilon = 1e-5 # Increased from 1e-6
         
         # Sort targets in descending order with stability
         try:
-            # Safer sorting with a small random noise to break ties consistently
-            random_noise = torch.randn_like(targets) * 1e-8
-            sorted_targets, indices = torch.sort(targets + random_noise, descending=True, dim=0)
+            # Add extra stability measures and stricter clipping
+            # Instead of random noise, use more deterministic approach
+            sorted_targets, indices = torch.sort(targets, descending=True, dim=0, stable=True)
             
             # Reorder scores according to target sorting
             ordered_scores = torch.gather(scores, 0, indices)
             
-            # Add a small constant to stabilize scores
-            ordered_scores = ordered_scores + epsilon
+            # Apply very strict clamping to keep values in safe range
+            ordered_scores = torch.clamp(ordered_scores, min=epsilon, max=1.0-epsilon)
             
-            # Apply log_softmax with temperature scaling and clamp extreme values
-            temperature = 0.5  # Increased from 0.3 for more stability
-            scores_softmax = F.log_softmax(ordered_scores / temperature, dim=0)
+            # Use a higher temperature for more stability
+            temperature = 1.0  # Increased from 0.8
             
-            # Stricter clamping to prevent extreme values
-            scores_softmax = torch.clamp(scores_softmax, min=-3, max=3)
+            # Apply a smoother softmax by scaling inputs to prevent extreme values
+            scaled_scores = ordered_scores / temperature
             
-            # Compute loss
-            loss = -torch.mean(scores_softmax)
+            # Scale the scores to a smaller range to prevent overflow
+            # Clamp BEFORE log_softmax
+            scaled_scores = torch.clamp(scaled_scores, min=-10, max=10)
             
-            # Safety check on the final loss
+            # Apply log_softmax with stability measures
+            scores_softmax = F.log_softmax(scaled_scores, dim=0)
+            
+            # Very strict clamping to prevent any extreme values
+            scores_softmax = torch.clamp(scores_softmax, min=-5, max=0)
+            
+            # Compute loss with a protective scaling factor
+            loss = -torch.mean(scores_softmax) * 0.1  # Scaled down from 0.5 to 0.1
+            
+            # Final safety check
             if torch.isnan(loss) or torch.isinf(loss):
-                return torch.tensor(0.3, device=scores.device, requires_grad=True)
+                return torch.tensor(0.1, device=scores.device, requires_grad=True)
                 
-            return torch.clamp(loss, min=-3, max=3)
+            return torch.clamp(loss, min=-1, max=1)
             
         except Exception as e:
             # If anything fails, return a safe fallback value
             print(f"ListMLELoss error: {str(e)}, returning fallback value")
-            return torch.tensor(0.3, device=scores.device, requires_grad=True)
+            return torch.tensor(0.1, device=scores.device, requires_grad=True)
 
 
 class MultiTaskCascadedLeadFunnelModel(nn.Module):
@@ -268,8 +311,8 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
         # Cap embedding dimensions to prevent instability with large vocabularies
         modified_embedding_dims = []
         for dim in embedding_dims:
-            # Cap embeddings at 25 dimensions for stability
-            modified_embedding_dims.append(min(25, dim))
+            # Cap embeddings at 50 dimensions for stability (increased from 25)
+            modified_embedding_dims.append(min(50, dim))
         
         # 1. Embedding layer
         self.embedding_layer = EmbeddingLayer(categorical_dims, modified_embedding_dims, numerical_dim)
@@ -285,12 +328,21 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
         )
 
         # 4. Task-specific transformer blocks
-        # ENHANCED: Deeper transformer path for toured stage (3 blocks instead of 1)
+        # SIMPLIFIED: Reduced Toured transformer blocks from 5 to 3
         self.transformer_toured = nn.Sequential(
             TabularTransformerBlock(transformer_dim, num_heads, ff_dim, dropout=dropout),
-            TabularTransformerBlock(transformer_dim, num_heads, ff_dim, dropout=dropout),  # Standard size
+            TabularTransformerBlock(transformer_dim, num_heads, ff_dim, dropout=dropout),
             TabularTransformerBlock(transformer_dim, num_heads, ff_dim, dropout=dropout)
         )
+        
+        # Add a specialized cross-attention mechanism just for toured stage
+        self.toured_attention = nn.MultiheadAttention(
+            embed_dim=transformer_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.toured_attention_norm = nn.LayerNorm(transformer_dim)
         
         # Add a special feature enhancement layer for toured prediction
         self.toured_feature_enhancement = nn.Sequential(
@@ -302,26 +354,18 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
         )
         
         # Regular transformers for other stages
-        self.transformer_applied = TabularTransformerBlock(transformer_dim, num_heads, ff_dim, dropout)
-        self.transformer_rented = TabularTransformerBlock(transformer_dim, num_heads, ff_dim, dropout)
+        self.transformer_applied = nn.Sequential(
+            TabularTransformerBlock(transformer_dim, num_heads, ff_dim, dropout),
+            TabularTransformerBlock(transformer_dim, num_heads, ff_dim, dropout) # Add second block
+        )
+        self.transformer_rented = nn.Sequential(
+            TabularTransformerBlock(transformer_dim, num_heads, ff_dim, dropout),
+            TabularTransformerBlock(transformer_dim, num_heads, ff_dim, dropout) # Add second block
+        )
 
         # 5. Prediction heads for each stage
-        # ENHANCED: Deeper prediction head for toured stage
-        toured_hidden_dims = [dim * 2 for dim in head_hidden_dims]  # Double the neurons
-        self.toured_head = nn.Sequential(
-            nn.Linear(transformer_dim, toured_hidden_dims[0]),
-            nn.BatchNorm1d(toured_hidden_dims[0]),
-            nn.ReLU(),
-            nn.Dropout(dropout + 0.1),  # Higher dropout
-            nn.Linear(toured_hidden_dims[0], toured_hidden_dims[0] // 2),
-            nn.BatchNorm1d(toured_hidden_dims[0] // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout + 0.05),
-            nn.Linear(toured_hidden_dims[0] // 2, 1),
-            nn.Sigmoid()
-        )
-        
-        # Regular prediction heads for other stages
+        # SIMPLIFIED: Use standard PredictionHead for Toured stage
+        self.toured_head = PredictionHead(transformer_dim, head_hidden_dims, dropout)
         self.applied_head = PredictionHead(transformer_dim, head_hidden_dims, dropout)
         self.rented_head = PredictionHead(transformer_dim, head_hidden_dims, dropout)
         
@@ -329,19 +373,37 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """More conservative weight initialization to prevent learning issues"""
+        """Stable weight initialization to prevent numerical instability"""
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
-                # Use more conservative initialization with smaller weights
-                nn.init.xavier_uniform_(module.weight.data, gain=0.2)
+                # Use very conservative initialization with much smaller gain
+                if 'toured_head' in name or 'transformer_toured' in name:
+                    nn.init.xavier_uniform_(module.weight.data, gain=0.1)  # Reduced from 0.3
+                else:
+                    nn.init.xavier_uniform_(module.weight.data, gain=0.1)  # Reduced from 0.2
+                    
                 if module.bias is not None:
                     nn.init.zeros_(module.bias.data)
+                
             elif isinstance(module, nn.LayerNorm):
                 nn.init.ones_(module.weight.data)
                 nn.init.zeros_(module.bias.data)
+                
             elif isinstance(module, nn.Embedding):
-                # Use more conservative embedding initialization
-                nn.init.normal_(module.weight.data, mean=0.0, std=0.02)
+                # Very careful initialization for embeddings
+                nn.init.normal_(module.weight.data, mean=0.0, std=0.01)  # Reduced std
+                
+            elif isinstance(module, nn.MultiheadAttention):
+                # Special initialization for attention mechanisms with small values
+                if hasattr(module, 'in_proj_weight') and module.in_proj_weight is not None:
+                    nn.init.xavier_uniform_(module.in_proj_weight, gain=0.05)  # Reduced gain
+                if hasattr(module, 'out_proj') and module.out_proj.weight is not None:
+                    nn.init.xavier_uniform_(module.out_proj.weight, gain=0.05)  # Reduced gain
+                
+                # Initialize any bias terms
+                for param_name, param in module.named_parameters():
+                    if 'bias' in param_name:
+                        nn.init.zeros_(param)
 
     def forward(self, categorical_inputs, numerical_inputs, lead_ids=None, is_training=True):
         """
@@ -368,10 +430,25 @@ class MultiTaskCascadedLeadFunnelModel(nn.Module):
             toured_features = self.transformer_toured(shared_features)
         else:
             toured_features = self.transformer_toured(shared_features)
-            
-        # Apply special feature enhancement for toured stage
+        
+        # Apply a simpler, more stable residual approach instead of full cross-attention
+        # Clamp the input values to prevent extreme values
+        toured_features_safe = torch.clamp(toured_features, min=-10, max=10)
+        # Use LayerNorm to help stabilize the features
+        toured_features = self.toured_attention_norm(toured_features_safe)
+
+        # Then continue with feature enhancement
         toured_features = self.toured_feature_enhancement(toured_features)
+
+        # Ensure no NaN/Inf values in features before prediction
+        toured_features = torch.nan_to_num(toured_features, nan=0.0)
+        toured_features = torch.clamp(toured_features, min=-10, max=10)
+        
+        # Apply simpler toured_head
         toured_pred = self.toured_head(toured_features)
+        
+        # Strong clamping for predictions to ensure they stay in valid sigmoid range
+        toured_pred = torch.clamp(toured_pred, min=1e-6, max=1-1e-6)
 
         # Handle empty batches gracefully
         if batch_size == 0:
@@ -575,6 +652,84 @@ def precision_at_k(y_true, y_scores, k):
     return num_relevant / k if k > 0 else 0.0
 
 
+def find_difficult_toured_examples(train_loader, model, fraction=0.2, device=None):
+    """
+    Find difficult examples for toured predictions based on incorrect predictions
+    or high loss values. Used for targeted learning.
+    
+    Args:
+        train_loader: DataLoader for training data
+        model: The model to evaluate
+        fraction: Fraction of difficult examples to collect
+        device: Device to use (defaults to model's device)
+        
+    Returns:
+        difficult_cat, difficult_num, difficult_tour: Tensors of selected difficult examples
+    """
+    if device is None:
+        device = next(model.parameters()).device
+        
+    model.eval()
+    
+    all_cat = []
+    all_num = []
+    all_tour = []
+    all_loss = []
+    
+    # Sample a subset of batches to find difficult examples
+    with torch.no_grad():
+        # Only check up to 20 batches to save time
+        for i, batch in enumerate(train_loader):
+            if i >= 20:  # Limit to first 20 batches to save time
+                break
+                
+            cat_in = batch[0].to(device)
+            num_in = batch[1].to(device)
+            tour_labels = batch[2].to(device)
+            
+            # Get predictions
+            outputs = model(cat_in, num_in)
+            if isinstance(outputs, tuple) and len(outputs) >= 3:
+                tour_pred = outputs[0]
+            else:
+                tour_pred = outputs
+            
+            # Calculate loss for each example
+            criterion = FocalLoss(alpha=0.25, gamma=2.0, reduction='none')
+            losses = criterion(tour_pred, tour_labels)
+            
+            # Convert to numpy for easier handling
+            cat_cpu = cat_in.cpu()
+            num_cpu = num_in.cpu()
+            tour_cpu = tour_labels.cpu()
+            loss_cpu = losses.cpu()
+            
+            # Store data
+            all_cat.append(cat_cpu)
+            all_num.append(num_cpu)
+            all_tour.append(tour_cpu)
+            all_loss.append(loss_cpu)
+    
+    if not all_cat:
+        return None, None, None
+        
+    # Combine all batches
+    all_cat = torch.cat(all_cat, dim=0)
+    all_num = torch.cat(all_num, dim=0)
+    all_tour = torch.cat(all_tour, dim=0)
+    all_loss = torch.cat(all_loss, dim=0)
+    
+    # Find the indices of the most difficult examples (highest loss)
+    _, difficult_indices = torch.topk(all_loss.squeeze(), k=int(fraction * len(all_loss)))
+    
+    # Select the difficult examples
+    difficult_cat = all_cat[difficult_indices].to(device)
+    difficult_num = all_num[difficult_indices].to(device)
+    difficult_tour = all_tour[difficult_indices].to(device)
+    
+    return difficult_cat, difficult_num, difficult_tour
+
+
 # Training function for cascaded model with ranking loss
 def train_cascaded_model(model,
                          train_loader,
@@ -582,19 +737,22 @@ def train_cascaded_model(model,
                          optimizer,
                          scheduler,
                          num_epochs=30,
-                         toured_weight=1.0,
+                         toured_weight=4.0,  # Increased from 1.0
                          applied_weight=1.0,
                          rented_weight=2.0,
-                         ranking_weight=0.3,  # Weight for the ranking loss component
+                         ranking_weight=0.2,
                          device='cuda',
                          early_stopping_patience=5,
                          model_save_path='best_model.pt',
                          mixed_precision=True,
                          gradient_accumulation_steps=1,
                          verbose=True,
-                         epoch_csv_path=None):  # New parameter to save per-epoch metrics to CSV
+                         epoch_csv_path=None,
+                         focus_on_difficult_examples=True,
+                         max_grad_norm=0.5):  # New parameter for strict gradient clipping
     """
-    Training loop for cascaded model with ranking loss
+    Training loop for cascaded model with ranking loss and specialized toured training
+    with enhanced numerical stability.
     """
     # Create CSV file for per-epoch metrics if requested
     csv_file = None
@@ -609,7 +767,8 @@ def train_cascaded_model(model,
             'epoch', 'train_loss', 'val_loss', 'learning_rate',
             'toured_auc', 'applied_auc', 'rented_auc',
             'toured_apr', 'applied_apr', 'rented_apr',
-            'toured_p50', 'applied_p50', 'rented_p50'
+            'toured_p50', 'applied_p50', 'rented_p50',
+            'toured_pmax', 'applied_pmax', 'rented_pmax'
         ]
         csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         csv_writer.writeheader()
@@ -618,17 +777,28 @@ def train_cascaded_model(model,
     scaler = torch.cuda.amp.GradScaler() if (mixed_precision and device == 'cuda') else None
 
     # Loss functions
-    # Standard classification losses with reduction='none' for more control
-    toured_criterion = nn.BCELoss(reduction='none')
-    applied_criterion = nn.BCELoss(reduction='none')
-    rented_criterion = nn.BCELoss(reduction='none')
+    # Use Focal Loss instead of BCE
+    # Lower alpha for majority class (Toured), higher for minority (Applied/Rented)
+    toured_criterion = FocalLoss(alpha=0.25, gamma=2.0, reduction='mean')
+    applied_criterion = FocalLoss(alpha=0.75, gamma=2.0, reduction='mean')
+    rented_criterion = FocalLoss(alpha=0.75, gamma=2.0, reduction='mean')
 
     # Ranking loss
     ranking_criterion = ListMLELoss()
 
+    # Initialize weight variables with default values
+    current_toured_weight = toured_weight
+    current_applied_weight = applied_weight  
+    current_rented_weight = rented_weight
+
     best_val_loss = float('inf')
     early_stopping_counter = 0
     history = {'train_loss': [], 'val_loss': [], 'lr': []}
+
+    # NEW: Warm-up settings
+    warm_up_epochs = 5
+    initial_lr = 1e-7 # Start very low
+    target_lr = optimizer.param_groups[0]['lr'] # Get target LR from optimizer
 
     # Print training configuration
     if verbose:
@@ -640,39 +810,39 @@ def train_cascaded_model(model,
         print(f"Early stopping patience: {early_stopping_patience}")
         print("-" * 60)
     
-    # WARM-UP PHASE: Use BCE only for first 2 epochs with lower learning rate
-    original_lr = optimizer.param_groups[0]['lr']
-    warm_up_epochs = 2
-    
     for epoch in range(num_epochs):
-        # During warm-up, use lower learning rate and simpler loss
-        is_warmup = epoch < warm_up_epochs
-        if is_warmup:
-            # Use 10% of the learning rate during warm-up
+        # NEW: Warm-up settings
+        if epoch < warm_up_epochs:
+            # Apply linear warm-up
+            lr = initial_lr + (target_lr - initial_lr) * (epoch / warm_up_epochs)
             for param_group in optimizer.param_groups:
-                param_group['lr'] = original_lr * 0.1
+                param_group['lr'] = lr
+            if verbose:
+                print(f"\nWARM-UP PHASE (Epoch {epoch+1}/{warm_up_epochs}): Set LR to {lr:.6f}")
+                
+            # During warm-up, still focus more on toured, but less aggressively
+            current_toured_weight = toured_weight * 1.0 # Full weight during warm-up
+            current_applied_weight = applied_weight * 0.5 # Reduced weight during warm-up
+            current_rented_weight = rented_weight * 0.5 # Reduced weight during warm-up
+            use_ranking_loss = False # No ranking during warm-up
+            focus_this_epoch = False # No difficult example focus during warm-up
             
-            if verbose and epoch == 0:
-                print("\nWARM-UP PHASE: Using reduced learning rate and BCE loss only")
-        elif epoch == warm_up_epochs:
-            # Gradual learning rate increase instead of immediate jump
+        else: # After warm-up
+            # Ensure LR is at target (scheduler might change it later)
             for param_group in optimizer.param_groups:
-                param_group['lr'] = original_lr * 0.2  # Start at 20% instead of full
-            if verbose:
-                print("\nWARM-UP COMPLETE: Using reduced learning rate (20%) with full loss function")
-        elif epoch == warm_up_epochs + 1:
-            # Further increase on the next epoch
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = original_lr * 0.5
-            if verbose:
-                print("Increasing learning rate to 50%")
-        elif epoch == warm_up_epochs + 2:
-            # Full learning rate only after 2 more epochs
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = original_lr
-            if verbose:
-                print("Restored original learning rate")
-        
+                param_group['lr'] = target_lr
+                
+            current_toured_weight = toured_weight
+            current_applied_weight = applied_weight
+            current_rented_weight = rented_weight
+            use_ranking_loss = True # Enable ranking loss after warm-up
+            focus_this_epoch = focus_on_difficult_examples and epoch % 3 == 0 # Check flag and epoch number
+            
+            if verbose and epoch == warm_up_epochs:
+                 print(f"\nWARM-UP COMPLETE. Using full LR: {target_lr:.6f} and loss weights.")
+                 if use_ranking_loss:
+                     print("   - Ranking loss enabled.")
+
         # -------- TRAINING --------
         model.train()
         train_loss = 0.0
@@ -685,6 +855,72 @@ def train_cascaded_model(model,
         else:
             train_iter = train_loader
 
+        # NEW: Focus on difficult toured examples every few epochs after warm-up
+        # Only run if focus_this_epoch is True
+        if focus_this_epoch:
+            if verbose:
+                print("\nFinding difficult toured examples for focused training...") # Added print
+                
+            difficult_cat, difficult_num, difficult_tour = find_difficult_toured_examples(
+                train_loader, model
+            )
+            
+            if difficult_cat is not None and len(difficult_cat) > 0:
+                if verbose:
+                    print(f"Found {len(difficult_cat)} difficult examples. Performing focused training...")
+                
+                # Train for several iterations on difficult examples
+                for _ in range(3):  # 3 iterations of focused training
+                    optimizer.zero_grad()
+                    
+                    if scaler is not None:
+                        # Mixed precision
+                        with torch.cuda.amp.autocast():
+                            outputs = model(difficult_cat, difficult_num)
+                            if isinstance(outputs, tuple) and len(outputs) >= 3:
+                                # Extract only toured predictions (first output)
+                                tour_pred = outputs[0]
+                            else:
+                                tour_pred = outputs
+                            
+                            # Focus exclusively on toured loss with higher weight
+                            tour_losses = toured_criterion(tour_pred, difficult_tour)
+                            tour_losses = torch.clamp(tour_losses, 0, 5)
+                            tour_loss = tour_losses.mean()
+                            
+                            # Apply extra weight for difficult examples
+                            focused_loss = 3.0 * toured_weight * tour_loss
+                            
+                        scaler.scale(focused_loss).backward()
+                        scaler.unscale_(optimizer)
+                        # Use the passed max_grad_norm parameter instead of hardcoded value
+                        nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)  # More strict gradient clipping
+                        scaler.step(optimizer)
+                    else:
+                        # No mixed precision
+                        outputs = model(difficult_cat, difficult_num)
+                        if isinstance(outputs, tuple) and len(outputs) >= 3:
+                            tour_pred = outputs[0]
+                        else:
+                            tour_pred = outputs
+                        
+                        # Focus exclusively on toured loss
+                        tour_losses = toured_criterion(tour_pred, difficult_tour)
+                        tour_losses = torch.clamp(tour_losses, 0, 5)
+                        tour_loss = tour_losses.mean()
+                        
+                        # Apply extra weight for difficult examples
+                        focused_loss = 3.0 * toured_weight * tour_loss
+                        
+                        focused_loss.backward()
+                        # Use the passed max_grad_norm parameter
+                        nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)  # More strict gradient clipping
+                        optimizer.step()
+                        optimizer.zero_grad()
+                
+                if verbose:
+                    print("Completed focused training phase.") # Added print
+        
         for batch_idx, batch in enumerate(train_iter):
             categorical_inputs = batch[0].to(device)
             numerical_inputs = batch[1].to(device)
@@ -712,75 +948,81 @@ def train_cascaded_model(model,
                         rented_pred = torch.clamp(rented_pred, epsilon, 1 - epsilon)
 
                         # Calculate BCE losses with focus on selected indices
-                        toured_losses = toured_criterion(toured_pred, toured_labels)
+                        # SIMPLIFIED LOSS CALCULATION
+                        toured_loss = toured_criterion(toured_pred, toured_labels)
+                        # toured_losses = torch.clamp(toured_losses, 0, 1.0)  # Reduced from 3.0 to 1.0
+                        # toured_losses = toured_losses * 0.8 + 0.05  # More aggressive smoothing
+                        # toured_loss = toured_losses.mean()
+                        # toured_loss = safe_loss(toured_loss, max_value=2.0, fallback=0.7, name="Toured") # Reduced max_value from 3.0
 
-                        # Add loss clipping to prevent extremely large loss values
-                        toured_losses = torch.clamp(toured_losses, 0, 5)
-                        toured_loss = toured_losses.mean()
+                        # For applied loss, create the tour_gt_mask
+                        # toured_gt_mask = (toured_labels == 1).float() * 1.5 + 0.5  # Weight 2.0 for true, 0.5 for false
+                        applied_loss = applied_criterion(applied_pred, applied_labels)
+                        # applied_losses = torch.clamp(applied_losses, 0, 1.0)  # Reduced from 3.0 to 1.0
+                        # applied_losses = applied_losses * 0.8 + 0.05  # More aggressive smoothing
+                        # applied_loss = (applied_losses * toured_gt_mask).mean()
+                        # applied_loss = safe_loss(applied_loss, max_value=2.0, fallback=0.7, name="Applied") # Reduced max_value from 3.0
 
-                        # For applied, weight higher for toured selected
-                        applied_losses = applied_criterion(applied_pred, applied_labels)
-                        applied_losses = torch.clamp(applied_losses, 0, 5)
+                        # For rented loss, create the applied_gt_mask
+                        # applied_gt_mask = (applied_labels == 1).float() * 1.5 + 0.5  # Weight 2.0 for true, 0.5 for false
+                        rented_loss = rented_criterion(rented_pred, rented_labels)
+                        # rented_losses = torch.clamp(rented_losses, 0, 1.0)  # Reduced from 3.0 to 1.0
+                        # rented_losses = rented_losses * 0.8 + 0.05  # More aggressive smoothing
+                        # rented_loss = (rented_losses * applied_gt_mask).mean()
+                        # rented_loss = safe_loss(rented_loss, max_value=2.0, fallback=0.7, name="Rented") # Reduced max_value from 3.0
 
-                        toured_mask = torch.ones_like(applied_losses, device=device)  # Default weight 1.0
-                        if len(toured_idx) > 0 and not is_warmup:  # Only use masks after warm-up
-                            toured_mask[toured_idx] = 2.0  # Higher weight for selected leads
-                            # Set mask for non-selected items
-                            non_selected_mask = ~torch.isin(torch.arange(len(toured_mask), device=device), toured_idx)
-                            toured_mask[non_selected_mask] = 0.5
-                        applied_loss = (applied_losses * toured_mask).mean()
+                        # Calculate bce_loss with the current weights
+                        bce_loss = current_toured_weight * toured_loss + \
+                                   current_applied_weight * applied_loss + \
+                                   current_rented_weight * rented_loss
 
-                        # For rented, weight higher for applied selected
-                        rented_losses = rented_criterion(rented_pred, rented_labels)
-                        rented_losses = torch.clamp(rented_losses, 0, 5)
-
-                        applied_mask = torch.ones_like(rented_losses, device=device)  # Default weight 1.0
-                        if len(applied_idx) > 0 and not is_warmup:  # Only use masks after warm-up
-                            applied_mask[applied_idx] = 2.0
-                            # Set mask for non-selected items
-                            non_selected_mask = ~torch.isin(torch.arange(len(applied_mask), device=device), applied_idx)
-                            applied_mask[non_selected_mask] = 0.5
-                        rented_loss = (rented_losses * applied_mask).mean()
-
-                        # Standard BCE loss
-                        bce_loss = toured_weight * toured_loss + \
-                                   applied_weight * applied_loss + \
-                                   rented_weight * rented_loss
+                        # Final safety check on combined loss
+                        # bce_loss = safe_loss(bce_loss, max_value=2.0, fallback=1.0, name="BCE Combined")
 
                         # Add Ranking Loss - only after warm-up and with enough batch size
-                        if not is_warmup and categorical_inputs.size(0) >= 10:
+                        ranking_loss_value = torch.tensor(0.0, device=device) # Default to 0
+                        if use_ranking_loss and categorical_inputs.size(0) >= 10:
                             try:
                                 toured_ranking_loss = ranking_criterion(toured_pred.squeeze(), toured_labels.squeeze())
                                 applied_ranking_loss = ranking_criterion(applied_pred.squeeze(),
                                                                          applied_labels.squeeze())
                                 rented_ranking_loss = ranking_criterion(rented_pred.squeeze(), rented_labels.squeeze())
 
-                                # Clamp ranking losses to safer values
-                                toured_ranking_loss = torch.clamp(toured_ranking_loss, -3, 3)
-                                applied_ranking_loss = torch.clamp(applied_ranking_loss, -3, 3)
-                                rented_ranking_loss = torch.clamp(rented_ranking_loss, -3, 3)
+                                # Apply safe_loss to individual ranking losses
+                                # toured_ranking_loss = safe_loss(toured_ranking_loss, max_value=1.0, fallback=0.1, name="Toured Ranking")
+                                # applied_ranking_loss = safe_loss(applied_ranking_loss, max_value=1.0, fallback=0.1, name="Applied Ranking")
+                                # rented_ranking_loss = safe_loss(rented_ranking_loss, max_value=1.0, fallback=0.1, name="Rented Ranking")
 
-                                ranking_loss = toured_weight * toured_ranking_loss + \
-                                               applied_weight * applied_ranking_loss + \
-                                               rented_weight * rented_ranking_loss
+                                ranking_loss_value = current_toured_weight * toured_ranking_loss + \
+                                               current_applied_weight * applied_ranking_loss + \
+                                               current_rented_weight * rented_ranking_loss
+                               
+                                # Apply safe_loss to combined ranking loss
+                                # ranking_loss_value = safe_loss(ranking_loss_value, max_value=1.5, fallback=0.2, name="Ranking Combined")
 
                                 # Combine BCE and ranking loss
-                                # loss = (1.0 - ranking_weight) * bce_loss + ranking_weight * ranking_loss
-                                loss = bce_loss # Temporarily use only BCE
+                                loss = (1.0 - ranking_weight) * bce_loss + ranking_weight * ranking_loss_value
                             except Exception as e:
-                                # Fallback if ranking loss fails
+                                # If ranking loss fails, just use BCE only
                                 if verbose:
-                                    print(f"Ranking loss failed: {str(e)}, using BCE only")
+                                    print(f"Ranking loss calculation failed: {str(e)}, using BCE only for this batch")
                                 loss = bce_loss
                         else:
-                            # Use only BCE during warm-up or if batch is too small
+                            # Use only BCE during warm-up, if batch is too small, or if ranking is disabled for the epoch
                             loss = bce_loss
 
                         # Final safety check on loss value - more conservative clamping
                         if not torch.isfinite(loss) or loss > 5:
                             if verbose:
                                 print(f"WARNING: Non-finite loss detected: {loss}. Using fallback value.")
-                            loss = torch.tensor(0.5, device=device, requires_grad=True)  # Safer fallback value
+                                # Print components for debugging
+                                print(f"  Components: BCE={bce_loss.item() if torch.isfinite(bce_loss) else 'NaN/Inf'}",
+                                      f"Rank={ranking_loss_value.item() if torch.isfinite(ranking_loss_value) else 'NaN/Inf'}",
+                                      f"UseRank={use_ranking_loss}")
+                            loss = torch.tensor(1.0, device=device, requires_grad=True)  # Safer fallback value
+
+                        # Final safety check on total loss
+                        # loss = safe_loss(loss, max_value=2.0, fallback=1.0, name="Total Loss")
 
                         # gradient accumulation
                         loss = loss / gradient_accumulation_steps
@@ -798,7 +1040,8 @@ def train_cascaded_model(model,
 
                     if (batch_idx + 1) % gradient_accumulation_steps == 0:
                         scaler.unscale_(optimizer)
-                        nn.utils.clip_grad_norm_(model.parameters(), 0.1)  # Much tighter clipping from 0.5
+                        # Use the passed max_grad_norm parameter instead of hardcoded value
+                        nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)  # More strict gradient clipping
                         scaler.step(optimizer)
                         scaler.update()
                         optimizer.zero_grad()
@@ -815,68 +1058,71 @@ def train_cascaded_model(model,
                     rented_pred = torch.clamp(rented_pred, epsilon, 1 - epsilon)
 
                     # Calculate BCE losses
-                    toured_losses = toured_criterion(toured_pred, toured_labels)
-                    toured_losses = torch.clamp(toured_losses, 0, 5)  # More conservative clamping
-                    toured_loss = toured_losses.mean()
+                    # SIMPLIFIED LOSS
+                    toured_loss = toured_criterion(toured_pred, toured_labels)
+                    # toured_losses = torch.clamp(toured_losses, 0, 1.0)  # Reduced from 3.0 to 1.0
+                    # toured_losses = toured_losses * 0.8 + 0.05  # More aggressive smoothing
+                    # toured_loss = toured_losses.mean()
+                    # toured_loss = safe_loss(toured_loss, max_value=2.0, fallback=0.7, name="Toured-NM") # Reduced max_value from 3.0
 
-                    applied_losses = applied_criterion(applied_pred, applied_labels)
-                    applied_losses = torch.clamp(applied_losses, 0, 5)  # More conservative clamping
+                    # For applied loss, create the tour_gt_mask
+                    # toured_gt_mask = (toured_labels == 1).float() * 1.5 + 0.5  # Weight 2.0 for true, 0.5 for false
+                    applied_loss = applied_criterion(applied_pred, applied_labels)
+                    # applied_losses = torch.clamp(applied_losses, 0, 1.0)  # Reduced from 3.0 to 1.0
+                    # applied_losses = applied_losses * 0.8 + 0.05  # More aggressive smoothing 
+                    # applied_loss = (applied_losses * toured_gt_mask).mean()
+                    # applied_loss = safe_loss(applied_loss, max_value=2.0, fallback=0.7, name="Applied-NM") # Reduced max_value from 3.0
 
-                    toured_mask = torch.ones_like(applied_losses, device=device)  # Default weight 1.0
-                    if len(toured_idx) > 0 and not is_warmup:  # Only use masks after warm-up
-                        toured_mask[toured_idx] = 2.0
-                        non_selected_mask = ~torch.isin(torch.arange(len(toured_mask), device=device), toured_idx)
-                        toured_mask[non_selected_mask] = 0.5
-                    applied_loss = (applied_losses * toured_mask).mean()
+                    # For rented loss, create the applied_gt_mask
+                    # applied_gt_mask = (applied_labels == 1).float() * 1.5 + 0.5  # Weight 2.0 for true, 0.5 for false
+                    rented_loss = rented_criterion(rented_pred, rented_labels)
+                    # rented_losses = torch.clamp(rented_losses, 0, 1.0)  # Reduced from 3.0 to 1.0
+                    # rented_losses = rented_losses * 0.8 + 0.05  # More aggressive smoothing
+                    # rented_loss = (rented_losses * applied_gt_mask).mean()
+                    # rented_loss = safe_loss(rented_loss, max_value=2.0, fallback=0.7, name="Rented-NM") # Reduced max_value from 3.0
 
-                    rented_losses = rented_criterion(rented_pred, rented_labels)
-                    rented_losses = torch.clamp(rented_losses, 0, 5)  # More conservative clamping
+                    # Calculate bce_loss with the current weights
+                    bce_loss = current_toured_weight * toured_loss + \
+                               current_applied_weight * applied_loss + \
+                               current_rented_weight * rented_loss
 
-                    applied_mask = torch.ones_like(rented_losses, device=device)  # Default weight 1.0
-                    if len(applied_idx) > 0 and not is_warmup:  # Only use masks after warm-up
-                        applied_mask[applied_idx] = 2.0
-                        non_selected_mask = ~torch.isin(torch.arange(len(applied_mask), device=device), applied_idx)
-                        applied_mask[non_selected_mask] = 0.5
-                    rented_loss = (rented_losses * applied_mask).mean()
+                    # Final safety check on combined loss
+                    # bce_loss = safe_loss(bce_loss, max_value=2.0, fallback=1.0, name="BCE Combined")
 
-                    # Standard BCE loss
-                    bce_loss = toured_weight * toured_loss + \
-                               applied_weight * applied_loss + \
-                               rented_weight * rented_loss
-
-                    # Add Ranking Loss - only after warm-up period
-                    if not is_warmup and categorical_inputs.size(0) >= 10:
+                    # Add Ranking Loss - only after warm-up period and if enabled for epoch
+                    ranking_loss_value = torch.tensor(0.0, device=device) # Default to 0
+                    if use_ranking_loss and categorical_inputs.size(0) >= 10:
                         try:
                             toured_ranking_loss = ranking_criterion(toured_pred.squeeze(), toured_labels.squeeze())
                             applied_ranking_loss = ranking_criterion(applied_pred.squeeze(), applied_labels.squeeze())
                             rented_ranking_loss = ranking_criterion(rented_pred.squeeze(), rented_labels.squeeze())
 
-                            # Clamp ranking losses to safer values
-                            toured_ranking_loss = torch.clamp(toured_ranking_loss, -3, 3)
-                            applied_ranking_loss = torch.clamp(applied_ranking_loss, -3, 3)
-                            rented_ranking_loss = torch.clamp(rented_ranking_loss, -3, 3)
+                            # Apply safe_loss to individual ranking losses
+                            # toured_ranking_loss = safe_loss(toured_ranking_loss, max_value=1.0, fallback=0.1, name="Toured Ranking-NM")
+                            # applied_ranking_loss = safe_loss(applied_ranking_loss, max_value=1.0, fallback=0.1, name="Applied Ranking-NM")
+                            # rented_ranking_loss = safe_loss(rented_ranking_loss, max_value=1.0, fallback=0.1, name="Rented Ranking-NM")
 
-                            ranking_loss = toured_weight * toured_ranking_loss + \
-                                           applied_weight * applied_ranking_loss + \
-                                           rented_weight * rented_ranking_loss
+                            ranking_loss_value = current_toured_weight * toured_ranking_loss + \
+                                           current_applied_weight * applied_ranking_loss + \
+                                           current_rented_weight * rented_ranking_loss
+                           
+                            # Apply safe_loss to combined ranking loss
+                            # ranking_loss_value = safe_loss(ranking_loss_value, max_value=1.5, fallback=0.2, name="Ranking Combined-NM")
 
                             # Combine BCE and ranking loss
-                            # loss = (1.0 - ranking_weight) * bce_loss + ranking_weight * ranking_loss
-                            loss = bce_loss # Temporarily use only BCE
+                            loss = (1.0 - ranking_weight) * bce_loss + ranking_weight * ranking_loss_value
                         except Exception as e:
                             if verbose:
-                                print(f"Ranking loss failed: {str(e)}, using BCE only")
+                                print(f"Ranking loss calculation failed: {str(e)}, using BCE only for this batch")
                             loss = bce_loss
                     else:
                         # Use only BCE during warm-up or if batch is too small
                         loss = bce_loss
 
-                    # Final safety check
-                    if not torch.isfinite(loss) or loss > 5:  # More conservative threshold
-                        if verbose:
-                            print(f"WARNING: Non-finite loss detected: {loss}. Using fallback value.")
-                        loss = torch.tensor(0.5, device=device, requires_grad=True)  # Safer fallback
+                    # Final safety check on total loss
+                    # loss = safe_loss(loss, max_value=2.0, fallback=1.0, name="Total Loss-NM")
 
+                    # gradient accumulation
                     loss = loss / gradient_accumulation_steps
 
                     # Skip backward pass if loss is invalid
@@ -891,7 +1137,8 @@ def train_cascaded_model(model,
                     loss.backward()
 
                     if (batch_idx + 1) % gradient_accumulation_steps == 0:
-                        nn.utils.clip_grad_norm_(model.parameters(), 0.1)  # Much tighter clipping
+                        # Use the passed max_grad_norm parameter instead of hardcoded value
+                        nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)  # More strict gradient clipping
                         optimizer.step()
                         optimizer.zero_grad()
 
@@ -962,24 +1209,15 @@ def train_cascaded_model(model,
                     applied_pred = torch.clamp(applied_pred, epsilon, 1 - epsilon)
                     rented_pred = torch.clamp(rented_pred, epsilon, 1 - epsilon)
 
-                    # Simple validation loss without weighting for simplicity
-                    toured_loss = toured_criterion(toured_pred, toured_labels).mean()
-                    applied_loss = applied_criterion(applied_pred, applied_labels).mean()
-                    rented_loss = rented_criterion(rented_pred, rented_labels).mean()
-
-                    if not torch.isfinite(toured_loss) or toured_loss > 50:
-                        toured_loss = torch.tensor(1.0, device=device, requires_grad=True)
-                    if not torch.isfinite(applied_loss) or applied_loss > 50:
-                        applied_loss = torch.tensor(1.0, device=device, requires_grad=True)
-                    if not torch.isfinite(rented_loss) or rented_loss > 50:
-                        rented_loss = torch.tensor(1.0, device=device, requires_grad=True)
-
-                    batch_loss = (toured_weight * toured_loss +
-                                  applied_weight * applied_loss +
-                                  rented_weight * rented_loss)
+                    # Simple validation loss using the same FocalLoss functions
+                    toured_loss = toured_criterion(toured_pred, toured_labels)
+                    applied_loss = applied_criterion(applied_pred, applied_labels)
+                    rented_loss = rented_criterion(rented_pred, rented_labels)
+                    
+                    batch_loss = toured_loss + applied_loss + rented_loss # Simple sum for validation loss metric
 
                     # Stricter clipping for batch loss
-                    if not torch.isfinite(batch_loss) or batch_loss > 50:
+                    if not torch.isfinite(batch_loss) or batch_loss > 10: # Reduced max validation loss check
                         batch_loss = torch.tensor(3.0, device=device)
 
                     val_loss += batch_loss.item()
@@ -1029,6 +1267,12 @@ def train_cascaded_model(model,
             applied_p50 = precision_at_k(all_applied_true.flatten(), all_applied_preds.flatten(), k)
             rented_p50 = precision_at_k(all_rented_true.flatten(), all_rented_preds.flatten(), k)
             
+            # Precision@max (using all examples)
+            k_max = len(all_toured_true)
+            toured_pmax = precision_at_k(all_toured_true.flatten(), all_toured_preds.flatten(), k_max)
+            applied_pmax = precision_at_k(all_applied_true.flatten(), all_applied_preds.flatten(), k_max)
+            rented_pmax = precision_at_k(all_rented_true.flatten(), all_rented_preds.flatten(), k_max)
+            
             # Add metrics to history
             if 'toured_auc' not in history:
                 history['toured_auc'] = []
@@ -1040,6 +1284,9 @@ def train_cascaded_model(model,
                 history['toured_p50'] = []
                 history['applied_p50'] = []
                 history['rented_p50'] = []
+                history['toured_pmax'] = []
+                history['applied_pmax'] = []
+                history['rented_pmax'] = []
                 
             history['toured_auc'].append(toured_auc)
             history['applied_auc'].append(applied_auc)
@@ -1050,6 +1297,9 @@ def train_cascaded_model(model,
             history['toured_p50'].append(toured_p50)
             history['applied_p50'].append(applied_p50)
             history['rented_p50'].append(rented_p50)
+            history['toured_pmax'].append(toured_pmax)
+            history['applied_pmax'].append(applied_pmax)
+            history['rented_pmax'].append(rented_pmax)
             
             has_metrics = True
             
@@ -1068,7 +1318,10 @@ def train_cascaded_model(model,
                     'rented_apr': rented_apr,
                     'toured_p50': toured_p50,
                     'applied_p50': applied_p50,
-                    'rented_p50': rented_p50
+                    'rented_p50': rented_p50,
+                    'toured_pmax': toured_pmax,
+                    'applied_pmax': applied_pmax,
+                    'rented_pmax': rented_pmax
                 })
                 # Flush to ensure data is written immediately
                 csv_file.flush()
@@ -1085,14 +1338,18 @@ def train_cascaded_model(model,
             print(f"Train loss: {train_loss:.4f} | Val loss: {val_loss:.4f} | LR: {current_lr:.6f}")
             
             if has_metrics:
-                print(f"\nMetrics:")
-                print(f"  Toured:  AUC={toured_auc:.4f}  APR={toured_apr:.4f}  P@50={toured_p50:.4f}")
-                print(f"  Applied: AUC={applied_auc:.4f}  APR={applied_apr:.4f}  P@50={applied_p50:.4f}")
-                print(f"  Rented:  AUC={rented_auc:.4f}  APR={rented_apr:.4f}  P@50={rented_p50:.4f}")
+                print(f"\nValidation Metrics:")
+                print(f"  Toured:  AUC={toured_auc:.4f}  APR={toured_apr:.4f}  P@50={toured_p50:.4f}  P@max={toured_pmax:.4f}")
+                print(f"  Applied: AUC={applied_auc:.4f}  APR={applied_apr:.4f}  P@50={applied_p50:.4f}  P@max={applied_pmax:.4f}")
+                print(f"  Rented:  AUC={rented_auc:.4f}  APR={rented_apr:.4f}  P@50={rented_p50:.4f}  P@max={rented_pmax:.4f}")
+                print(f"  Max predictions (k_max): {k_max}")
             print("-" * 60)
 
-        # Step LR scheduler
-        scheduler.step(val_loss)
+        # Step LR scheduler *after* warm-up phase
+        if epoch >= warm_up_epochs:
+            scheduler.step() # Step the main scheduler (e.g., CosineAnnealingLR)
+        # else: # During warm-up, LR is set manually
+            # pass 
 
         # Early stopping
         if val_loss < best_val_loss:
@@ -1244,3 +1501,59 @@ def cascade_rank_leads(model, dataloader, device='cuda', silent=True):
         }
     }
     return result
+
+# NEW: Focal Loss Implementation
+class FocalLoss(nn.Module):
+    """Focal Loss, as described in https://arxiv.org/abs/1708.02002.
+
+    It is used to address dataset imbalance. It forces training to focus learning
+    on hard examples and down-weights the loss value contributed by easy examples.
+    """
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+        """Focal Loss
+
+        Args:
+            alpha (float, optional): Weighting factor for the positive class. Defaults to 0.25.
+            gamma (float, optional): Focusing parameter. Defaults to 2.0.
+            reduction (str, optional): Specifies the reduction to apply to the output:
+                'none' | 'mean' | 'sum'. 'none': no reduction will be applied,
+                'mean': the sum of the output will be divided by the number of
+                elements in the output, 'sum': the output will be summed.
+                Defaults to 'mean'.
+        """
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        """Forward pass
+
+        Args:
+            inputs (torch.Tensor): Predicted probabilities, shape [N, 1] or [N].
+            targets (torch.Tensor): Ground truth labels, shape [N, 1] or [N].
+
+        Returns:
+            torch.Tensor: Calculated focal loss.
+        """
+        # Ensure inputs and targets are same shape
+        if inputs.shape != targets.shape:
+            targets = targets.view_as(inputs)
+            
+        # Ensure inputs are probabilities (0-1)
+        BCE_loss = F.binary_cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-BCE_loss)  # Computes pt = p if targets=1, pt = 1-p if targets=0
+        
+        # Calculate alpha weight for each sample
+        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        
+        # Calculate Focal loss
+        F_loss = alpha_t * (1 - pt)**self.gamma * BCE_loss
+
+        # Apply reduction
+        if self.reduction == 'mean':
+            return F_loss.mean()
+        elif self.reduction == 'sum':
+            return F_loss.sum()
+        else:  # 'none'
+            return F_loss

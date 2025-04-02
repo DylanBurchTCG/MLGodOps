@@ -16,7 +16,7 @@ from model_architecture import MultiTaskCascadedLeadFunnelModel, train_cascaded_
     precision_at_k
 from training_pipeline import (analyze_group_differences,
                                finetune_with_external_examples,
-                               perform_stage_specific_clustering)
+                               perform_stage_specific_clustering, evaluate_cluster_specific_metrics)
 from data_preparation import (preprocess_data,
                               prepare_external_examples,
                               visualize_group_differences)
@@ -37,8 +37,14 @@ def parse_args():
     parser.add_argument('--gradient_accum', type=int, default=8,
                         help='Gradient accumulation steps (use higher values for larger batch sizes)')
     parser.add_argument('--batch_size', type=int, default=2000, help='Batch size for training')
-    parser.add_argument('--epochs', type=int, default=30, help='Number of training epochs')
+    parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
+
+    # Loss weights
+    parser.add_argument('--toured_weight', type=float, default=4.0, help='Weight for toured stage loss')
+    parser.add_argument('--applied_weight', type=float, default=3.0, help='Weight for applied stage loss')
+    parser.add_argument('--rented_weight', type=float, default=3.0, help='Weight for rented stage loss')
+    parser.add_argument('--ranking_weight', type=float, default=0.2, help='Weight for ranking loss component (0 to disable)')
 
     # Funnel selection options - fixed count vs. percentage-based
     parser.add_argument('--use_percentages', action='store_true', 
@@ -140,6 +146,21 @@ def calculate_metrics(dataloader, model, device, k_values=[10, 20, 50, 100]):
     all_rented_preds = np.vstack(all_rented_preds).flatten()
     all_rented_true = np.vstack(all_rented_true).flatten()
 
+    # --- Filtering for cascade evaluation ---
+    toured_mask = all_toured_true == 1
+    applied_mask = all_applied_true == 1
+
+    # Filter data for applied stage (only where toured is true)
+    applied_preds_filtered = all_applied_preds[toured_mask]
+    applied_true_filtered = all_applied_true[toured_mask]
+
+    # Filter data for rented stage (only where applied is true)
+    # Note: This assumes the model predicts rented even if applied is false for evaluation purposes
+    #       A stricter filter might be applied_mask & toured_mask
+    rented_preds_filtered = all_rented_preds[applied_mask]
+    rented_true_filtered = all_rented_true[applied_mask]
+    # --- End Filtering ---
+
     # Calculate metrics
     metrics = {
         'toured': {
@@ -148,35 +169,49 @@ def calculate_metrics(dataloader, model, device, k_values=[10, 20, 50, 100]):
             'precision_at_k': {}
         },
         'applied': {
-            'roc_auc': roc_auc_score(all_applied_true, all_applied_preds),
-            'apr': average_precision_score(all_applied_true, all_applied_preds),
+            # Use filtered data
+            'roc_auc': roc_auc_score(applied_true_filtered, applied_preds_filtered) if len(applied_true_filtered) > 1 and len(np.unique(applied_true_filtered)) > 1 else np.nan,
+            'apr': average_precision_score(applied_true_filtered, applied_preds_filtered) if len(applied_true_filtered) > 1 and len(np.unique(applied_true_filtered)) > 1 else np.nan,
             'precision_at_k': {}
         },
         'rented': {
-            'roc_auc': roc_auc_score(all_rented_true, all_rented_preds),
-            'apr': average_precision_score(all_rented_true, all_rented_preds),
+            # Use filtered data
+            'roc_auc': roc_auc_score(rented_true_filtered, rented_preds_filtered) if len(rented_true_filtered) > 1 and len(np.unique(rented_true_filtered)) > 1 else np.nan,
+            'apr': average_precision_score(rented_true_filtered, rented_preds_filtered) if len(rented_true_filtered) > 1 and len(np.unique(rented_true_filtered)) > 1 else np.nan,
             'precision_at_k': {}
         }
     }
 
     # Calculate Precision@k for various k values
     for k in k_values:
-        for stage, preds, true in [
-            ('toured', all_toured_preds, all_toured_true),
-            ('applied', all_applied_preds, all_applied_true),
-            ('rented', all_rented_preds, all_rented_true)
-        ]:
-            if len(true) >= k:  # Only calculate if we have enough samples
-                p_at_k = precision_at_k(true, preds, k)
-                metrics[stage]['precision_at_k'][k] = p_at_k
+        # Toured (original)
+        if len(all_toured_true) >= k:
+            p_at_k = precision_at_k(all_toured_true, all_toured_preds, k)
+            metrics['toured']['precision_at_k'][k] = p_at_k
+
+        # Applied (filtered)
+        if len(applied_true_filtered) >= k:
+            p_at_k = precision_at_k(applied_true_filtered, applied_preds_filtered, k)
+            metrics['applied']['precision_at_k'][k] = p_at_k
+
+        # Rented (filtered)
+        if len(rented_true_filtered) >= k:
+            p_at_k = precision_at_k(rented_true_filtered, rented_preds_filtered, k)
+            metrics['rented']['precision_at_k'][k] = p_at_k
 
     # Print metrics
-    print(f"Metrics:")
+    print(f"Metrics (Applied/Rented evaluated on relevant subset):")
     for stage in ['toured', 'applied', 'rented']:
-        print(f"{stage.capitalize()} => ROC-AUC: {metrics[stage]['roc_auc']:.4f}, APR: {metrics[stage]['apr']:.4f}")
+        # Handle potential NaN values from filtering
+        auc_val = metrics[stage]['roc_auc']
+        apr_val = metrics[stage]['apr']
+        auc_str = f"{auc_val:.4f}" if not np.isnan(auc_val) else "N/A"
+        apr_str = f"{apr_val:.4f}" if not np.isnan(apr_val) else "N/A"
+        
+        print(f"{stage.capitalize():<8} => ROC-AUC: {auc_str}, APR: {apr_str}")
         if 'precision_at_k' in metrics[stage]:
-            for k, value in metrics[stage]['precision_at_k'].items():
-                print(f"  P@{k}: {value:.4f}", end=" ")
+            for k_val, value in metrics[stage]['precision_at_k'].items():
+                print(f"  P@{k_val}: {value:.4f}", end=" ")
         print()
 
     return metrics
@@ -587,8 +622,13 @@ def calculate_actual_stage_rates(train_dataset, preprocessed_rates=None):
 
 
 def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_dims, numerical_dim, results,
-                       subset_label="single"):
+                       subset_label="single", seed=None):
     """Train and evaluate a model for a single subset, storing results in the results dictionary"""
+
+    # Ensure the output directories exist
+    multiseed_subdir = os.path.join(args.output_dir, 'multiseed_runs')
+    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(multiseed_subdir, exist_ok=True)
 
     # Get preprocessed stage rates if available
     preprocessed_rates = results.get('preprocessing', {}).get('stage_rates', None)
@@ -628,10 +668,14 @@ def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_di
     total_feature_dim = sum(embedding_dims) + numerical_dim
 
     # ENHANCED: Larger transformer dimensions for improved capacity
-    transformer_dim = 320  # Increased from 256
-    num_heads = 8  # Increased from 4
+    transformer_dim = 512  # Increased from 320
+    num_heads = 16  # Increased from 8
+    ff_dim = 1024 # Increased from 512
     if transformer_dim % num_heads != 0:
-        transformer_dim = (transformer_dim // num_heads) * num_heads
+        # Adjust ff_dim based on new transformer_dim if needed, or adjust transformer_dim
+        transformer_dim = (transformer_dim // num_heads) * num_heads 
+        print(f"Adjusted transformer_dim to {transformer_dim} to be divisible by num_heads={num_heads}")
+        # ff_dim might need adjustment too if based on transformer_dim
 
     print("\n" + "="*80)
     print(f"TRAINING MODEL FOR {subset_label}")
@@ -656,14 +700,14 @@ def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_di
         numerical_dim=numerical_dim,
         transformer_dim=transformer_dim,
         num_heads=num_heads,
-        ff_dim=512,
+        ff_dim=ff_dim, 
         head_hidden_dims=[128, 64],
-        dropout=0.3,  # Increased dropout for better regularization
+        dropout=0.3,
         toured_k=args.toured_k,
         applied_k=args.applied_k,
         rented_k=args.rented_k,
-        use_percentages=args.use_percentages,  # Pass new percentage flag
-        toured_pct=args.toured_pct,            # Pass percentage values
+        use_percentages=args.use_percentages,
+        toured_pct=args.toured_pct,
         applied_pct=args.applied_pct,
         rented_pct=args.rented_pct
     ).to(device)
@@ -675,35 +719,68 @@ def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_di
     if args.debug:
         model = enable_debug_mode(model)
 
-    # ENHANCED: Improved optimizer with weight decay and gradient clipping
-    # Use a lower learning rate and clip gradients more aggressively
-    optimizer = torch.optim.AdamW(
-        model.parameters(), 
-        lr=args.lr,
-        weight_decay=0.01,  # Add weight decay for regularization
-        eps=1e-8  # For numeric stability
-    )
+    # ENHANCED: Create separate parameter groups for toured and non-toured components
+    # for dedicated learning rates to improve toured stage predictions
+    toured_params = []
+    other_params = []
+    
+    # Group toured-specific components
+    if hasattr(model, 'toured_head'):
+        toured_params.extend(model.toured_head.parameters())
+    if hasattr(model, 'transformer_toured'):
+        toured_params.extend(model.transformer_toured.parameters())
+    if hasattr(model, 'toured_feature_enhancement'):
+        toured_params.extend(model.toured_feature_enhancement.parameters())
+    if hasattr(model, 'toured_attention'):
+        toured_params.extend(model.toured_attention.parameters())
+    if hasattr(model, 'toured_attention_norm'):
+        toured_params.extend(model.toured_attention_norm.parameters())
+    
+    # All remaining parameters
+    for name, param in model.named_parameters():
+        if not any(p is param for p in toured_params):
+            other_params.append(param)
+    
+    # ENHANCED: Create optimizer with specialized learning rates and numerical stability settings
+    optimizer = torch.optim.AdamW([
+        {'params': toured_params, 'lr': args.lr * 1.2},  # Reduced from 1.5 to 1.2
+        {'params': other_params, 'lr': args.lr}
+    ], weight_decay=0.01, eps=1e-5)  # Increased eps for stability from 1e-6
+
+    print(f"Created specialized optimizer with:")
+    print(f"  - Toured components: {len(toured_params)} params with LR={args.lr*1.2:.6f}")
+    print(f"  - Other components: {len(other_params)} params with LR={args.lr:.6f}")
+    print(f"  - Epsilon: 1e-5, Weight decay: 0.01")
     
     # Use a more robust scheduler with patience
-    scheduler = ReduceLROnPlateau(
-        optimizer, 
-        mode='min', 
-        factor=0.5, 
-        patience=4,  # Increased from 3
-        verbose=True,
-        min_lr=1e-6
+    # scheduler = ReduceLROnPlateau(
+    #     optimizer, 
+    #     mode='min', 
+    #     factor=0.5, 
+    #     patience=4,
+    #     verbose=True,
+    #     min_lr=1e-6
+    # )
+    
+    # NEW: Use CosineAnnealingLR scheduler
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=args.epochs - 5,  # Allow 5 epochs for warm-up
+        eta_min=1e-7  # Minimum learning rate
     )
+    print(f"Using CosineAnnealingLR scheduler with T_max={args.epochs - 5}, eta_min=1e-7")
 
     # Temporarily create model file for train_cascaded_model
     # We'll delete this file later after loading its contents
     temp_model_path = os.path.join(args.output_dir, f'temp_model_{subset_label}.pt')
 
-    # Prepare CSV file paths
-    history_csv_path = os.path.join(args.output_dir, f'{subset_label}_history.csv')
-    metrics_csv_path = os.path.join(args.output_dir, f'{subset_label}_metrics.csv')
-    rankings_csv_path = os.path.join(args.output_dir, f'{subset_label}_rankings.csv')
-    summary_csv_path = os.path.join(args.output_dir, f'{subset_label}_summary.csv')
-    epoch_csv_path = os.path.join(args.output_dir, f'{subset_label}_epochs.csv')
+    # Prepare CSV file paths - ADD SEED PREFIX IF PROVIDED and save to subfolder
+    filename_prefix = f"seed_{seed}_" if seed is not None else ""
+    history_csv_path = os.path.join(multiseed_subdir, f'{filename_prefix}{subset_label}_history.csv')
+    metrics_csv_path = os.path.join(multiseed_subdir, f'{filename_prefix}{subset_label}_metrics.csv')
+    rankings_csv_path = os.path.join(multiseed_subdir, f'{filename_prefix}{subset_label}_rankings.csv')
+    summary_csv_path = os.path.join(multiseed_subdir, f'{filename_prefix}{subset_label}_summary.csv')
+    epoch_csv_path = os.path.join(multiseed_subdir, f'{filename_prefix}{subset_label}_epochs.csv')
 
     print(f"Starting training with {len(train_dataset)} samples...")
     print(f"Training configuration:")
@@ -718,7 +795,7 @@ def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_di
     else:
         print(f"  - Selection stages: {args.toured_k} -> {args.applied_k} -> {args.rented_k}")
     
-    print(f"  - CSV output will be saved to {args.output_dir}\n")
+    print(f"  - CSV output will be saved to {multiseed_subdir}\n")
 
     # Use the cascaded training function with ranking loss
     # ENHANCED: Increased weight for toured stage to 3.0 (from 1.0)
@@ -729,16 +806,18 @@ def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_di
         optimizer,
         scheduler,
         num_epochs=args.epochs,
-        toured_weight=3.0,  # Increased weight for toured stage
-        applied_weight=1.0,
-        rented_weight=2.0,
-        ranking_weight=0.4,  # Increased from 0.3 to emphasize ranking performance
+        toured_weight=args.toured_weight,
+        applied_weight=args.applied_weight,
+        rented_weight=args.rented_weight,
+        ranking_weight=args.ranking_weight,
         device=device,
         model_save_path=temp_model_path,
         mixed_precision=args.mixed_precision,
         gradient_accumulation_steps=args.gradient_accum,
-        verbose=True,  # Always enable verbose output
-        epoch_csv_path=epoch_csv_path  # Add epoch-by-epoch CSV logging
+        verbose=True,
+        epoch_csv_path=epoch_csv_path,
+        focus_on_difficult_examples=False, # Disabled temporarily
+        max_grad_norm=1.0  # Relaxed from 0.5
     )
 
     # Save training history to CSV
@@ -812,7 +891,8 @@ def train_and_evaluate(train_dataset, test_dataset, args, device, categorical_di
             'history': history_csv_path,
             'metrics': metrics_csv_path,
             'rankings': rankings_csv_path,
-            'summary': summary_csv_path
+            'summary': summary_csv_path,
+            'epochs': epoch_csv_path # Store epoch csv path too
         }
     }
     
@@ -1006,7 +1086,8 @@ def train_with_seed(args, seed=None):
             categorical_dims,
             numerical_dim,
             results,
-            subset_label="single"
+            subset_label="single",
+            seed=seed
         )
 
     else:
@@ -1039,7 +1120,8 @@ def train_with_seed(args, seed=None):
                 categorical_dims,
                 numerical_dim,
                 results,
-                subset_label=subset_label
+                subset_label=subset_label,
+                seed=seed
             )
 
     # Save all results to a single joblib file
@@ -1092,6 +1174,48 @@ def create_seed_summary(all_seeds_results, output_path):
                         ])
     
     print(f"Summary of all seed runs saved to {output_path}")
+
+
+def consolidate_epoch_data(output_dir, output_filename="all_seeds_epochs.csv"):
+    """Find all seed_XXX_epochs.csv files, load them, add seed column, and save together."""
+    multiseed_subdir = os.path.join(output_dir, 'multiseed_runs') # Define the subdirectory path
+
+    if not os.path.exists(multiseed_subdir):
+        print(f"Subdirectory '{multiseed_subdir}' not found. No epoch files to consolidate.")
+        return
+
+    # Look for files inside the subdirectory
+    all_epoch_files = [f for f in os.listdir(multiseed_subdir) if f.startswith('seed_') and f.endswith('_epochs.csv')]
+
+    if not all_epoch_files:
+        print(f"No seed-specific epoch files found in '{multiseed_subdir}' to consolidate.")
+        return
+
+    all_data = []
+    for filename in all_epoch_files:
+        try:
+            # Extract seed number from filename
+            seed = int(filename.split('_')[1])
+            filepath = os.path.join(multiseed_subdir, filename) # Read from the subdirectory
+            df = pd.read_csv(filepath)
+            df['seed'] = seed
+            # Reorder columns to put seed first
+            cols = ['seed'] + [col for col in df.columns if col != 'seed']
+            df = df[cols]
+            all_data.append(df)
+            print(f"* Loaded {filename} (seed {seed})")
+        except Exception as e:
+            print(f"Warning: Could not process file {filename}: {str(e)}")
+
+    if not all_data:
+        print("No data loaded from epoch files.")
+        return
+
+    consolidated_df = pd.concat(all_data, ignore_index=True)
+    # Save the final consolidated file to the main output directory
+    output_path = os.path.join(output_dir, output_filename)
+    consolidated_df.to_csv(output_path, index=False)
+    print(f"Consolidated epoch data from {len(all_epoch_files)} runs saved to {output_path}")
 
 
 def perform_stage_specific_analysis(model, train_dataset, test_dataset, args, device, feature_names, subset_label="single"):
@@ -1192,6 +1316,9 @@ def main():
         # Create a summary CSV report
         seed_summary_path = os.path.join(args.output_dir, "seed_summary.csv")
         create_seed_summary(all_seeds_results, seed_summary_path)
+
+        # Consolidate epoch data
+        consolidate_epoch_data(args.output_dir)
     else:
         # Single seed run
         train_with_seed(args)

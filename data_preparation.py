@@ -20,7 +20,7 @@ def preprocess_data(
         target_cols=['TOTAL_APPOINTMENT_COMPLETED', 'TOTAL_APPLIED', 'TOTAL_RENTED'],
         test_size=0.2,
         random_state=42,
-        max_categories=100,  # Reduced from default to prevent too many categories
+        max_categories=250,  # Increased from 100 to prevent dropping potentially useful categoricals
         save_preprocessors=True,
         preprocessors_path='./preprocessors',
         num_subsets=1,  # How many subsets to create (default=1 => no subsets, just entire data)
@@ -33,7 +33,8 @@ def preprocess_data(
         rented_pct=0.5,
         toured_k=2000,
         applied_k=2000,
-        rented_k=2000
+        rented_k=2000,
+        adapt_to_data=False
 ):
     """
     Preprocess the lead data for the neural network model.
@@ -111,9 +112,56 @@ def preprocess_data(
     print(f"* Applied rate among toured leads: {stage_rates['applied_given_toured']*100:.2f}%")
     print(f"* Rented rate among applied leads: {stage_rates['rented_given_applied']*100:.2f}%")
 
-    print("\n4. Feature Engineering...")
+    print("\n4. Feature Selection & Early Cleaning...")
     print("-"*40)
-    # Use data dictionary to find "important columns" if wanted
+
+    # --- PREVENT LEAKAGE: Drop target columns *before* feature engineering ---
+    print(f"* Dropping target columns: {target_cols}")
+    data = data.drop(columns=target_cols, errors='ignore')
+    # -----------------------------------------------------------------------
+
+    # --- Define and drop irrelevant/leaky columns BEFORE feature engineering ---
+    cols_to_drop = [
+        "HASH", "RECD_LUID", "RECD_P_ID", "RECD_A_ID", "CLIENT_PERSON_ID", "CLIENT_ID", "RN",
+        "FNAM_FNAM", "MNAM_MNAM", "PFXT_PFXT", "SNAM_SNAM", "SFXT_SFXT", "FIRST_NAME", "LAST_NAME", "EMAIL", "PHONE",
+        "ADDRESS_LINE_1", "ADDRESS_LINE_2", "CITY", "STRT_NAME_I1", "STRT_POST_I1", "STRT_PRED_I1", "STRT_SUFX_I1",
+        "QUALIFIED", "EXTRACT_DATE", "NCOA_MOVE_UPDATE_DATE", "NCOA_MOVE_UPDATE_METHOD_CODE",
+        "EST_CURRENT_MORTGAGE_AMOUNT", "ENRICHMENTESTIMATED_CURRENT_MORTGAGE_AMT", "EST_MONTHLY_MORTGAGE_PAYMENT",
+        "EST_CURRENT_LOAN-TO-VALUE_RATIO", "EST_AVAILABLE_EQUITY_LL", "ESTIMATED_AVAILABLE_EQUITY",
+        "EQTY_LNDR_I1", "MORT_LNDR_I1", "REFI_LNDR_I1",
+        "GROUP_ID", "GROUP_NAME", "LEAD_CREATED_AT", "CITY_PLAC_I1", "COUNTY_CODE_I1", "STATE_ABBR_I1", "STATE_I1",
+        "RECD_ZIPC_I1", "SCDY_NUMB_I1", "SCDY_DESG_I1", "INVS_TYPE_I1", "PRCH_TYPE_I1", "TOTAL_WALK_IN"
+    ]
+
+    # Separate ID column *before* dropping it
+    if 'CLIENT_PERSON_ID' in data.columns:
+        lead_ids = data['CLIENT_PERSON_ID'].copy()
+        print(f"* Extracted {len(lead_ids)} CLIENT_PERSON_IDs")
+    else:
+        # Create sequential IDs if the ID column is missing
+        lead_ids = pd.Series(np.arange(len(data)))
+        print("* No CLIENT_PERSON_ID found, creating sequential IDs")
+
+    # Drop the specified columns (including CLIENT_PERSON_ID now)
+    num_cols_before_drop = len(data.columns)
+    data = data.drop(columns=[col for col in cols_to_drop if col in data.columns], errors='ignore')
+    num_cols_after_drop = len(data.columns)
+    print(f"* Dropped {num_cols_before_drop - num_cols_after_drop} specified irrelevant/leaky columns")
+
+    # Remove columns with >95% missing values BEFORE feature engineering
+    num_cols_before_missing = len(data.columns)
+    missing_pct = data.isnull().mean()
+    cols_to_drop_missing = missing_pct[missing_pct > 0.95].index
+    if len(cols_to_drop_missing) > 0:
+        data = data.drop(cols_to_drop_missing, axis=1)
+        print(f"* Dropped {len(cols_to_drop_missing)} columns with >95% missing values")
+    else:
+        print("* No columns found with >95% missing values")
+    # ---------------------------------------------------------------------------
+
+    print("\n5. Feature Engineering...")
+    print("-"*40)
+    # Use data dictionary to find "important columns" if wanted (operates on already reduced 'data')
     important_cols = []
     if data_dict is not None:
         lead_keywords = ['lead', 'customer', 'client', 'property', 'apartment', 'rent', 'tour', 'visit']
@@ -121,10 +169,13 @@ def preprocess_data(
             matching_fields = data_dict[data_dict['LONG_DESCRIPTION'].str.contains(keyword, case=False, na=False)]
             important_cols.extend(matching_fields['FIELD_NAME'].tolist())
         print(f"* Identified {len(important_cols)} potentially important columns from data dictionary")
-    
+
     # NEW: Enhanced feature engineering for toured prediction
+    # Create a temporary DataFrame to store new features
+    new_features_df = pd.DataFrame(index=data.index)
+    
     if enhance_toured_features:
-        print("\n4.1 Creating specialized features for toured prediction...")
+        print("\n5.1 Creating specialized features for toured prediction...")
         
         # Track initial column count for reporting
         initial_column_count = len(data.columns)
@@ -146,46 +197,122 @@ def preprocess_data(
         # Create time-based features if date columns exist
         if date_columns:
             # Find most promising date column (highest correlation with toured)
-            best_date_col = None
             best_corr = 0
             for col in date_columns:
                 try:
                     # Convert to datetime
-                    data[f'{col}_dt'] = pd.to_datetime(data[col], errors='coerce')
+                    # Create temporary series first
+                    dt_col = pd.to_datetime(data[col], errors='coerce')
                     
                     # Extract day of week
-                    data[f'{col}_dow'] = data[f'{col}_dt'].dt.dayofweek
+                    dow_col = dt_col.dt.dayofweek
                     
                     # Check correlation
-                    corr = abs(data[f'{col}_dow'].corr(y_toured, method='spearman'))
+                    corr = abs(dow_col.corr(y_toured, method='spearman'))
                     if corr > best_corr:
                         best_corr = corr
                         best_date_col = col
+                        # Store the promising dt and dow columns temporarily
+                        best_dt_series = dt_col
+                        best_dow_series = dow_col
                 except:
                     # Skip if there are issues with this column
                     continue
                     
             if best_date_col:
                 print(f"* Using '{best_date_col}' for time-based features (corr={best_corr:.4f})")
-                col = best_date_col
+                # Use the stored series
+                new_features_df[f'{best_date_col}_dt'] = best_dt_series
+                new_features_df[f'{best_date_col}_dow'] = best_dow_series
                 
                 # Create more time features from the best date column
                 try:
-                    data[f'{col}_month'] = data[f'{col}_dt'].dt.month
-                    data[f'{col}_day'] = data[f'{col}_dt'].dt.day
-                    data[f'{col}_hour'] = data[f'{col}_dt'].dt.hour
-                    data[f'{col}_weekend'] = (data[f'{col}_dow'] >= 5).astype(int)
+                    new_features_df[f'{best_date_col}_month'] = best_dt_series.dt.month
+                    new_features_df[f'{best_date_col}_day'] = best_dt_series.dt.day
+                    new_features_df[f'{best_date_col}_hour'] = best_dt_series.dt.hour
+                    new_features_df[f'{best_date_col}_weekend'] = (best_dow_series >= 5).astype(int)
+                    
+                    # ENHANCED: Create more sophisticated time features
+                    # Quarter of year
+                    new_features_df[f'{best_date_col}_quarter'] = best_dt_series.dt.quarter
+                    
+                    # Week of year
+                    new_features_df[f'{best_date_col}_week'] = best_dt_series.dt.isocalendar().week
+                    
+                    # Hour bins (morning, afternoon, evening, night)
+                    new_features_df[f'{best_date_col}_hour_bin'] = pd.cut(
+                        new_features_df[f'{best_date_col}_hour'], 
+                        bins=[0, 6, 12, 18, 24], 
+                        labels=['night', 'morning', 'afternoon', 'evening']
+                    )
+                    
+                    # Day of month bins (early, mid, late month)
+                    new_features_df[f'{best_date_col}_day_bin'] = pd.cut(
+                        new_features_df[f'{best_date_col}_day'], 
+                        bins=[0, 10, 20, 32], 
+                        labels=['early', 'mid', 'late']
+                    )
                     
                     # Combine features - time of day categories
-                    data['time_category'] = 0  # default
-                    data.loc[data[f'{col}_hour'].between(0, 5), 'time_category'] = 1  # night
-                    data.loc[data[f'{col}_hour'].between(6, 11), 'time_category'] = 2  # morning
-                    data.loc[data[f'{col}_hour'].between(12, 17), 'time_category'] = 3  # afternoon
-                    data.loc[data[f'{col}_hour'].between(18, 23), 'time_category'] = 4  # evening
+                    # Initialize with a default value
+                    time_category_series = pd.Series(0, index=data.index)
+                    time_category_series.loc[new_features_df[f'{best_date_col}_hour'].between(0, 5)] = 1  # night
+                    time_category_series.loc[new_features_df[f'{best_date_col}_hour'].between(6, 11)] = 2  # morning
+                    time_category_series.loc[new_features_df[f'{best_date_col}_hour'].between(12, 17)] = 3  # afternoon
+                    time_category_series.loc[new_features_df[f'{best_date_col}_hour'].between(18, 23)] = 4  # evening
+                    new_features_df['time_category'] = time_category_series
+
+                    # Create season feature
+                    new_features_df[f'{best_date_col}_season'] = pd.cut(
+                        new_features_df[f'{best_date_col}_month'], 
+                        bins=[0, 3, 6, 9, 13], 
+                        labels=['winter', 'spring', 'summer', 'fall']
+                    )
                     
-                    print(f"* Created time-of-day categories: Night (1), Morning (2), Afternoon (3), Evening (4)")
-                except:
-                    print(f"* Could not create all time features for {col}")
+                    # Day type (weekday vs weekend)
+                    new_features_df[f'{best_date_col}_day_type'] = (best_dow_series < 5).map({True: 'weekday', False: 'weekend'})
+                    
+                    # Create "hours since midnight" feature for finer time granularity
+                    new_features_df[f'{best_date_col}_hours_since_midnight'] = new_features_df[f'{best_date_col}_hour'] + best_dt_series.dt.minute / 60
+                    
+                    print(f"* Created comprehensive time features including hour bins, day bins, and seasons")
+                except Exception as e:
+                    print(f"* Could not create all time features for {best_date_col}: {str(e)}")
+        
+        # ENHANCED: Add more behavioral and contextual features for toured prediction
+        behavior_features = []
+        
+        # Try to identify engagement-related columns
+        engagement_keywords = ['click', 'visit', 'view', 'open', 'engage', 'activity', 'interest', 'action', 'contact']
+        engagement_cols = []
+        
+        for kw in engagement_keywords:
+            matching = [col for col in data.columns if kw.lower() in col.lower()]
+            engagement_cols.extend(matching)
+        
+        print(f"* Identified {len(engagement_cols)} potential engagement columns")
+        
+        # Create engagement score from these columns
+        if engagement_cols:
+            try:
+                for col in engagement_cols:
+                    if pd.api.types.is_numeric_dtype(data[col]):
+                        # Min-max scaling for engagement metrics
+                        col_min = data[col].min()
+                        col_max = data[col].max()
+                        if col_max > col_min:
+                            # Store normalized feature in temp df
+                            new_features_df[f'{col}_norm'] = (data[col] - col_min) / (col_max - col_min)
+                            behavior_features.append(f'{col}_norm')
+                
+                # Create overall engagement score
+                if behavior_features:
+                    # Calculate from temp df columns
+                    new_features_df['engagement_score'] = new_features_df[behavior_features].mean(axis=1)
+                    new_features_df['engagement_score'] = new_features_df['engagement_score'].fillna(0)
+                    print(f"* Created engagement score from {len(behavior_features)} features")
+            except Exception as e:
+                print(f"* Could not create engagement score: {str(e)}")
         
         # Try to identify lead quality features
         quality_keywords = ['income', 'credit', 'budget', 'qual', 'eligib', 'grade', 'tier', 'score']
@@ -206,7 +333,8 @@ def preprocess_data(
                     col_mean = data[col].mean()
                     col_std = data[col].std()
                     if col_std > 0:
-                        data[f'{col}_zscore'] = (data[col] - col_mean) / col_std
+                        # Store z-score in temp df
+                        new_features_df[f'{col}_zscore'] = (data[col] - col_mean) / col_std
                         quality_features.append(f'{col}_zscore')
             except:
                 continue
@@ -214,12 +342,47 @@ def preprocess_data(
         if quality_features:
             try:
                 print(f"* Creating lead quality score from {len(quality_features)} features")
-                data['lead_quality_score'] = data[quality_features].mean(axis=1)
+                # Calculate score from temp df columns
+                new_features_df['lead_quality_score'] = new_features_df[quality_features].mean(axis=1)
                 
                 # Fill missing values with median
-                data['lead_quality_score'] = data['lead_quality_score'].fillna(data['lead_quality_score'].median())
-            except:
-                print("* Could not create lead quality score")
+                new_features_df['lead_quality_score'] = new_features_df['lead_quality_score'].fillna(new_features_df['lead_quality_score'].median())
+                
+                # ENHANCED: Create quality bins for better categorization
+                new_features_df['quality_bin'] = pd.qcut(
+                    new_features_df['lead_quality_score'].rank(method='first'), 
+                    5, 
+                    labels=['very_low', 'low', 'medium', 'high', 'very_high']
+                )
+                print("* Created quality bins from lead quality score")
+            except Exception as e:
+                print(f"* Could not create lead quality score: {str(e)}")
+        
+        # ENHANCED: Create interaction features between key metrics
+        try:
+            # Combine quality and engagement if both exist
+            if 'lead_quality_score' in new_features_df.columns and 'engagement_score' in new_features_df.columns:
+                new_features_df['quality_engagement_interaction'] = new_features_df['lead_quality_score'] * new_features_df['engagement_score']
+                print("* Created quality-engagement interaction feature")
+                
+            # Combine time and quality if both exist
+            if 'time_category' in new_features_df.columns and 'lead_quality_score' in new_features_df.columns:
+                new_features_df['time_quality_interaction'] = new_features_df['time_category'] * new_features_df['lead_quality_score']
+                print("* Created time-quality interaction feature")
+                
+            # If weekend flag exists, use it for interactions
+            weekend_col = None
+            # Check in new_features_df first
+            for col in new_features_df.columns:
+                if 'weekend' in col.lower():
+                    weekend_col = col
+                    break
+                
+            if weekend_col and 'lead_quality_score' in new_features_df.columns:
+                new_features_df['weekend_quality_interaction'] = new_features_df[weekend_col] * new_features_df['lead_quality_score']
+                print("* Created weekend-quality interaction feature")
+        except Exception as e:
+            print(f"* Could not create some interaction features: {str(e)}")
         
         # Create location features if zip/location information is present
         location_keywords = ['zip', 'state', 'city', 'postal', 'region', 'area', 'location', 'address']
@@ -250,102 +413,108 @@ def preprocess_data(
             # For zip/postal code, try to get first 3 digits (regional area)
             if 'zip' in best_loc_col.lower() or 'postal' in best_loc_col.lower():
                 try:
-                    data[f'{best_loc_col}_region'] = data[best_loc_col].astype(str).str[:3]
+                    # Create region feature in temp df
+                    new_features_df[f'{best_loc_col}_region'] = data[best_loc_col].astype(str).str[:3]
                     print(f"* Created region feature from {best_loc_col}")
-                except:
-                    pass
-        
-        # Create combined features (interactions)
-        # Try combinations of important features
-        try:
-            # Day of week x time of day
-            if 'time_category' in data.columns and f'{best_date_col}_dow' in data.columns:
-                data['day_time_interaction'] = data[f'{best_date_col}_dow'] * 10 + data['time_category']
-                print("* Created day_time_interaction feature")
+                except Exception as e:
+                    print(f"* Could not create region feature: {str(e)}")
                 
-            # Quality x Location
-            if 'lead_quality_score' in data.columns and f'{best_loc_col}_region' in data.columns:
-                # Group quality by region
-                region_avg_quality = data.groupby(f'{best_loc_col}_region')['lead_quality_score'].mean()
-                data['region_quality_diff'] = data.apply(
-                    lambda row: row['lead_quality_score'] - region_avg_quality.get(row[f'{best_loc_col}_region'], 0),
-                    axis=1
+        # ENHANCED: Create day-of-week specific engagement metrics
+        dow_col = None
+        for col in new_features_df.columns:
+             if 'dow' in col.lower():
+                  dow_col = col
+                  break
+                  
+        if 'engagement_score' in new_features_df.columns and dow_col:
+            try:
+                # Create day-specific engagement scores in temp df
+                for day in range(7):
+                    mask = new_features_df[dow_col] == day
+                    if mask.sum() > 0:
+                        day_name = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'][day]
+                        # Initialize column first
+                        new_features_df[f'engagement_{day_name}'] = 0.0 # Use float for engagement
+                        new_features_df.loc[mask, f'engagement_{day_name}'] = new_features_df.loc[mask, 'engagement_score']
+                print("* Created day-of-week specific engagement metrics")
+            except Exception as e:
+                print(f"* Could not create day-specific engagement metrics: {str(e)}")
+            
+        # ENHANCED: RFM-style analysis if we have date and engagement data
+        if best_date_col and 'engagement_score' in new_features_df.columns:
+            try:
+                # Get most recent date in dataset for reference
+                # Use the temporary dt series
+                max_date = new_features_df[f'{best_date_col}_dt'].max()
+                
+                # Calculate recency (days since last engagement)
+                new_features_df['recency_days'] = (max_date - new_features_df[f'{best_date_col}_dt']).dt.days
+                
+                # Bin recency into categories
+                new_features_df['recency_bin'] = pd.cut(
+                    new_features_df['recency_days'], 
+                    bins=[0, 7, 30, 90, float('inf')], 
+                    labels=['very_recent', 'recent', 'moderate', 'old']
                 )
-                print("* Created region_quality_diff feature")
-        except:
-            print("* Could not create some interaction features")
+                
+                print("* Created RFM-style recency metrics")
+            except Exception as e:
+                print(f"* Could not create recency metrics: {str(e)}")
         
         # Calculate the actual number of new columns added
-        new_features_added = len(data.columns) - initial_column_count
-        print(f"* Feature engineering complete - added {new_features_added} new features")
+        new_features_added = len(new_features_df.columns)
+        # --- Concatenate new features to the original DataFrame ---
+        print(f"* Feature engineering complete - adding {new_features_added} new features...")
+        data = pd.concat([data, new_features_df], axis=1)
+        print(f"* Final DataFrame shape after feature engineering: {data.shape}")
 
-    # Drop target columns from the feature set
-    print("\n5. Feature Selection...")
+    # Feature Selection section is no longer needed for dropping columns
+    # The assignment X = data is also removed as 'data' is now the primary DataFrame
+
+    print("\n6. Identify Feature Types...")
     print("-"*40)
-    X = data.drop(target_cols, axis=1)
-
-    # Drop specified columns
-    cols_to_drop = [
-        "HASH", "RECD_LUID", "RECD_P_ID", "RECD_A_ID", "CLIENT_PERSON_ID", "CLIENT_ID", "RN",
-        "FNAM_FNAM", "MNAM_MNAM", "PFXT_PFXT", "SNAM_SNAM", "SFXT_SFXT", "FIRST_NAME", "LAST_NAME", "EMAIL", "PHONE",
-        "ADDRESS_LINE_1", "ADDRESS_LINE_2", "CITY", "STRT_NAME_I1", "STRT_POST_I1", "STRT_PRED_I1", "STRT_SUFX_I1",
-        "QUALIFIED", "EXTRACT_DATE", "NCOA_MOVE_UPDATE_DATE", "NCOA_MOVE_UPDATE_METHOD_CODE",
-        "EST_CURRENT_MORTGAGE_AMOUNT", "ENRICHMENTESTIMATED_CURRENT_MORTGAGE_AMT", "EST_MONTHLY_MORTGAGE_PAYMENT",
-        "EST_CURRENT_LOAN-TO-VALUE_RATIO", "EST_AVAILABLE_EQUITY_LL", "ESTIMATED_AVAILABLE_EQUITY",
-        "EQTY_LNDR_I1", "MORT_LNDR_I1", "REFI_LNDR_I1",
-        "GROUP_ID", "GROUP_NAME", "LEAD_CREATED_AT", "CITY_PLAC_I1", "COUNTY_CODE_I1", "STATE_ABBR_I1", "STATE_I1",
-        "RECD_ZIPC_I1", "SCDY_NUMB_I1", "SCDY_DESG_I1", "INVS_TYPE_I1", "PRCH_TYPE_I1", "TOTAL_WALK_IN"
-    ]
-    X = X.drop(columns=[col for col in cols_to_drop if col in X.columns], errors='ignore')
-
-    # Remove columns with >95% missing values
-    missing_pct = X.isnull().mean()
-    cols_to_drop_missing = missing_pct[missing_pct > 0.95].index
-    X = X.drop(cols_to_drop_missing, axis=1)
-    print(f"* Dropped {len(cols_to_drop_missing)} columns with >95% missing values")
-
-    # Separate ID column if it exists
-    if 'CLIENT_PERSON_ID' in X.columns:
-        lead_ids = X['CLIENT_PERSON_ID'].copy()
-        X = X.drop('CLIENT_PERSON_ID', axis=1)
-    else:
-        lead_ids = pd.Series(np.arange(len(X)))
-        print("* No CLIENT_PERSON_ID found, creating sequential IDs")
 
     # Identify categorical vs numerical columns - with better high-cardinality handling
+    # Operate directly on the 'data' DataFrame now
     categorical_cols = []
     numerical_cols = []
     high_cardinality_cols = []
-    
-    for col in X.columns:
-        n_unique = X[col].nunique()
-        if X[col].dtype == 'object' or (X[col].dtype in ['int64', 'float64'] and n_unique < 20):
+
+    for col in data.columns:
+        n_unique = data[col].nunique()
+        # Check if dtype is object OR if it's numeric but has few unique values (likely categorical)
+        # Also consider string type explicitly
+        if data[col].dtype == 'object' or str(data[col].dtype) == 'string' or \
+           (pd.api.types.is_numeric_dtype(data[col]) and n_unique < 20 and not pd.api.types.is_float_dtype(data[col])): # Heuristic for numeric categoricals
             if n_unique <= max_categories:
                 categorical_cols.append(col)
             else:
                 # For high-cardinality categorical columns, either:
-                # 1. Treat as numerical if numeric type
+                # 1. Treat as numerical if numeric type (already handled by next condition)
                 # 2. Drop if text type with too many values (would create huge embeddings)
-                if X[col].dtype in ['int64', 'float64']:
-                    numerical_cols.append(col)
-                    print(f"* Moving high-cardinality column '{col}' ({n_unique} values) to numerical features")
+                if pd.api.types.is_numeric_dtype(data[col]): # Check if it's numeric despite being identified as categorical heuristic
+                     numerical_cols.append(col)
+                     print(f"* Moving high-cardinality numeric column '{col}' ({n_unique} values) back to numerical features")
                 else:
                     high_cardinality_cols.append(col)
-                    print(f"* Dropping high-cardinality column '{col}' ({n_unique} values) to prevent memory issues")
-        elif X[col].dtype in ['int64', 'float64']:
+                    print(f"* Marking high-cardinality column '{col}' ({n_unique} values) for potential drop")
+        elif pd.api.types.is_numeric_dtype(data[col]):
             numerical_cols.append(col)
+        # else: # Handle other types if necessary, e.g., datetime (should ideally be engineered)
+            # print(f"Skipping column '{col}' with unhandled dtype: {data[col].dtype}")
 
     # Drop high-cardinality categorical columns to prevent embedding explosion
-    X = X.drop(columns=high_cardinality_cols, errors='ignore')
-    
-    print(f"* Identified {len(categorical_cols)} categorical columns and {len(numerical_cols)} numerical columns")
-    print(f"* Dropped {len(high_cardinality_cols)} high-cardinality categorical columns to prevent memory issues")
+    if high_cardinality_cols:
+        data = data.drop(columns=high_cardinality_cols, errors='ignore')
+        print(f"* Dropped {len(high_cardinality_cols)} high-cardinality categorical columns: {high_cardinality_cols}")
 
-    print("\n6. Handling Missing Values...")
+    print(f"* Identified {len(categorical_cols)} categorical columns and {len(numerical_cols)} numerical columns")
+
+    print("\n7. Handling Missing Values...")
     print("-"*40)
     # Handle missing values
     # For numerical: impute with median and handle infinity values
-    numerical_data = X[numerical_cols].copy()
+    numerical_data = data[numerical_cols].copy()
 
     # Check for columns with all missing values
     all_missing = numerical_data.columns[numerical_data.isnull().all()].tolist()
@@ -375,9 +544,15 @@ def preprocess_data(
     
     # Clip extreme values to prevent training instability
     for col in numerical_cols:
-        if numerical_data[col].dtype in ['float64']:
+        # Check if column exists and is numeric before clipping
+        if col in numerical_data.columns and pd.api.types.is_numeric_dtype(numerical_data[col]):
             q1 = numerical_data[col].quantile(0.01)
             q3 = numerical_data[col].quantile(0.99)
+            # Check for constant columns or NaN quantiles
+            if pd.isna(q1) or pd.isna(q3) or q1 == q3:
+                 print(f"* Skipping clipping for column '{col}' (constant or NaN quantiles)")
+                 continue
+
             # Wider range to preserve more data while removing extremes
             lower_bound = q1 - 5 * (q3 - q1)
             upper_bound = q3 + 5 * (q3 - q1)
@@ -389,7 +564,7 @@ def preprocess_data(
                 numerical_data[col] = numerical_data[col].clip(lower_bound, upper_bound)
 
     # For categorical: impute with mode
-    categorical_data = X[categorical_cols].copy()
+    categorical_data = data[categorical_cols].copy()
     for col in categorical_cols:
         # Check if column is all missing
         if categorical_data[col].isnull().all():
@@ -602,7 +777,7 @@ def preprocess_data(
 
     # -------------- If num_subsets == 1, just do the entire dataset --------------
     if num_subsets <= 1:
-        print("\n7. Train/Test Split...")
+        print("\n8. Train/Test Split...")
         print("-"*40)
         if enhance_toured_features:
             print("Enhanced feature engineering enabled for toured prediction")
@@ -623,7 +798,7 @@ def preprocess_data(
             print(f"* Training set: {len(train_dataset):,} samples")
             print(f"* Testing set:  {len(test_dataset):,} samples")
 
-            print("\n8. Final Class Distribution (Train Set):")
+            print("\n9. Final Class Distribution (Train Set):")
             print("-"*40)
             toured_labels = torch.stack([item[2] for item in train_dataset])
             applied_labels = torch.stack([item[3] for item in train_dataset])
@@ -665,18 +840,24 @@ def preprocess_data(
         # we create multiple smaller runs.
 
         # Convert main data to a single DataFrame for easy sampling
-        big_df = pd.DataFrame({
+        # Combine labels and lead_ids first
+        big_df_labels = pd.DataFrame({
             "y_toured": y_toured,
             "y_applied": y_applied,
             "y_rent": y_rent,
             "lead_id": lead_ids
         })
-        # Add back in the cat & num data
-        # We'll keep them separate for processing, but let's unify indexes
-        cat_df = categorical_data.reset_index(drop=True)
-        num_df = numerical_data.reset_index(drop=True)
-        big_df = big_df.reset_index(drop=True)
-        big_df_catnum = pd.concat([big_df, cat_df, num_df], axis=1)
+
+        # Use the already processed 'data' DataFrame (contains cat and num features)
+        # Ensure indices match before concatenating
+        data = data.reset_index(drop=True)
+        big_df_labels = big_df_labels.reset_index(drop=True)
+
+        # Check lengths before concat
+        if len(data) != len(big_df_labels):
+             raise ValueError(f"Mismatch in lengths before concat: data={len(data)}, labels={len(big_df_labels)}")
+
+        big_df_catnum = pd.concat([big_df_labels, data], axis=1)
 
         # If balancing is requested, we attempt to select an equal number of rented=1 and rented=0
         # in each subset. Or at least keep the ratio 50-50 if possible.
@@ -712,9 +893,10 @@ def preprocess_data(
                 y_rent_sub = subset_df["y_rent"].values
                 lead_id_sub = subset_df["lead_id"].values
 
-                # Rebuild the cat & num data from the subset
-                subset_cat = subset_df[cat_df.columns]
-                subset_num = subset_df[num_df.columns]
+                # Rebuild the cat & num data from the subset using the correct columns
+                # Ensure we use the *final* lists of categorical/numerical columns
+                subset_cat = subset_df[[col for col in categorical_cols if col in subset_df.columns]]
+                subset_num = subset_df[[col for col in numerical_cols if col in subset_df.columns]]
 
                 print(f"\nBuilding subset {subset_i + 1}/{num_subsets} with {len(subset_df)} leads")
                 print(
