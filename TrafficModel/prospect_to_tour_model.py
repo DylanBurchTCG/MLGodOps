@@ -2,96 +2,62 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import pandas as pd
-from sklearn.preprocessing import StandardScaler
-from torch.utils.data import Dataset, DataLoader
-import matplotlib.pyplot as plt
-from tqdm import tqdm
-import os
-import joblib
 
-class TourPredictionModel(nn.Module):
-    def __init__(self, 
+
+class SimplifiedTourModel(nn.Module):
+    def __init__(self,
                  categorical_dims,
                  embedding_dims,
                  numerical_dim,
-                 hidden_units=[512, 256, 128],
-                 dropout=0.2,  # Reduced dropout for moderately imbalanced data
-                 use_batch_norm=True,
-                 toured_rate=0.3712):  # Add toured rate parameter
+                 hidden_units=[256, 128, 64],
+                 dropout=0.3,
+                 use_batch_norm=True):
         super().__init__()
-        
-        self.toured_rate = toured_rate  # Store the class distribution
-        
-        # Embedding layer for categorical features
+
+        # Embedding layers for categorical features
         self.embeddings = nn.ModuleList([
-            nn.Embedding(dim, emb_dim) 
+            nn.Embedding(dim, emb_dim)
             for dim, emb_dim in zip(categorical_dims, embedding_dims)
         ])
-        
+
         # Calculate total input dimension
         total_emb_dim = sum(embedding_dims)
         input_dim = total_emb_dim + numerical_dim
-        
-        # Feature enhancement layer with attention
-        self.feature_enhancement = nn.Sequential(
-            nn.Linear(input_dim, input_dim * 2),
-            nn.LayerNorm(input_dim * 2),
+
+        # Simplified feature attention - just one layer of attention instead of multiple
+        self.feature_attention = nn.Sequential(
+            nn.Linear(input_dim, input_dim),
+            nn.LayerNorm(input_dim),
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(input_dim * 2, input_dim)
+            nn.Dropout(dropout)
         )
-        
-        # Multi-head attention for feature importance
-        self.feature_attention = nn.MultiheadAttention(
-            embed_dim=input_dim,
-            num_heads=4,
-            dropout=dropout,
-            batch_first=True
-        )
-        self.attention_norm = nn.LayerNorm(input_dim)
-        
-        # Multi-layer network with residual connections and batch normalization
+
+        # Build MLP layers with batch norm and dropout
         self.layers = nn.ModuleList()
         self.batch_norms = nn.ModuleList()
         self.dropouts = nn.ModuleList()
-        self.residual_layers = nn.ModuleList()
-        
+
         prev_dim = input_dim
-        for i, hidden_dim in enumerate(hidden_units):
-            # Main layer
+        for hidden_dim in hidden_units:
             self.layers.append(nn.Linear(prev_dim, hidden_dim))
-            
-            # Batch normalization
+
             if use_batch_norm:
                 self.batch_norms.append(nn.BatchNorm1d(hidden_dim))
             else:
                 self.batch_norms.append(nn.Identity())
-                
-            # Dropout
+
             self.dropouts.append(nn.Dropout(dropout))
-            
-            # Residual connection (if dimensions match)
-            if prev_dim == hidden_dim:
-                self.residual_layers.append(nn.Identity())
-            else:
-                self.residual_layers.append(nn.Linear(prev_dim, hidden_dim))
-                
             prev_dim = hidden_dim
-        
-        # Final prediction layer with adaptive threshold
-        self.toured_head = nn.Sequential(
-            nn.Linear(hidden_units[-1], 64),
-            nn.LayerNorm(64),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, 1),
+
+        # Final prediction layer
+        self.prediction_head = nn.Sequential(
+            nn.Linear(hidden_units[-1], 1),
             nn.Sigmoid()
         )
-        
+
         # Initialize weights
         self._init_weights()
-    
+
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
@@ -106,13 +72,13 @@ class TourPredictionModel(nn.Module):
             elif isinstance(m, nn.LayerNorm):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
-    
+
     def forward(self, categorical_inputs, numerical_inputs):
         # Process categorical features
         embeddings = []
         for i, embedding_layer in enumerate(self.embeddings):
             embeddings.append(embedding_layer(categorical_inputs[:, i]))
-        
+
         # Concatenate embeddings horizontally
         if embeddings:
             x_cat = torch.cat(embeddings, dim=1)
@@ -124,29 +90,19 @@ class TourPredictionModel(nn.Module):
         else:
             # Only numerical features
             x = numerical_inputs
-            
-        # Feature enhancement
-        x = self.feature_enhancement(x)
-        
-        # Apply multi-head attention
-        x = x.unsqueeze(1)  # Add sequence dimension
-        x_attended, attention_weights = self.feature_attention(x, x, x)
-        x = x_attended.squeeze(1)
-        x = self.attention_norm(x)
-        
-        # Forward through deep network with residual connections
+
+        # Apply feature attention
+        x = self.feature_attention(x)
+
+        # Forward through MLP network
         for i in range(len(self.layers)):
-            # Main path
-            z = self.layers[i](x)
-            z = F.gelu(z)  # Using GELU for better gradient flow
-            z = self.batch_norms[i](z)
-            z = self.dropouts[i](z)
-            
-            # Residual connection
-            res = self.residual_layers[i](x)
-            x = z + res
-        
+            x = self.layers[i](x)
+            x = F.gelu(x)  # Use GELU for smoother gradients
+            x = self.batch_norms[i](x)
+            x = self.dropouts[i](x)
+
         # Final prediction
-        toured_pred = self.toured_head(x)
-        
-        return toured_pred, attention_weights
+        predictions = self.prediction_head(x)
+
+        # Return predictions and None for attention weights to maintain interface compatibility
+        return predictions, None
